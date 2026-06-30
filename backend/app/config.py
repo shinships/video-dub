@@ -2,11 +2,55 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _force_utf8_console() -> None:
+    """Console Windows mặc định dùng cp1252, không in được tiếng Việt -> crash khi print/log.
+    Ép UTF-8 ngay từ điểm vào chung (CLI lẫn uvicorn) để chuỗi tiếng Việt luôn in được."""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_console()
+
+
+def _load_dotenv(path: Path) -> None:
+    """Nạp .env một lần cho MỌI điểm vào (uvicorn, CLI, test). Env đã set sẵn được giữ."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        os.environ.setdefault(name.strip(), value.strip())
+
+
+_load_dotenv(ROOT / ".env")
+
+
+def _prefer_adc_over_stray_credentials() -> None:
+    """GOOGLE_APPLICATION_CREDENTIALS có thể bị set toàn hệ thống cho công cụ KHÁC (vd Google
+    Docs service account) và sẽ âm thầm chiếm quyền xác thực, gọi nhầm sang project/quyền sai
+    (TTS/Speech bị từ chối dù project đích đã bật API). Mặc định ưu tiên ADC qua gcloud login;
+    chỉ giữ GOOGLE_APPLICATION_CREDENTIALS khi người dùng chủ động khai báo cho project này
+    qua VIDEO_DUB_USE_GCLOUD_AUTH=false (tức không dùng gcloud auth)."""
+    if os.getenv("VIDEO_DUB_USE_GCLOUD_AUTH", "true").lower() not in {"0", "false", "no"}:
+        os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+
+
+_prefer_adc_over_stray_credentials()
 
 
 @dataclass(frozen=True)

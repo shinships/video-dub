@@ -1,2 +1,8 @@
+# Pin torch/torchaudio < 2.6: torch 2.6+ đổi mặc định torch.load(weights_only=True),
+# phá khả năng nạp checkpoint cũ của Demucs 4.0.1. Cài CUDA build theo README nếu có GPU.
+torch==2.5.1
+torchaudio==2.5.1
+soundfile>=0.12.1  # backend ghi WAV cho torchaudio trên Windows — thiếu sẽ làm Demucs lỗi khi lưu file
 demucs==4.0.1
 faster-whisper==1.1.0
+yt-dlp==2025.6.9

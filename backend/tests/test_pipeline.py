@@ -1,11 +1,14 @@
 import json
+import time
 
 from app.pipeline import (
     ATEMPO_MAX,
     ATEMPO_MIN,
     _atempo_chain,
+    _is_rate_limited,
     _parse_translations,
     _pitch_chain,
+    _RateLimiter,
     _strip_json,
     fit_score,
 )
@@ -60,3 +63,20 @@ def test_fit_score_prefers_real_audio_duration():
     assert fit_score("bất kỳ", 4.0, audio_seconds=4.0) == 99
     # Audio dài gấp rưỡi khung → điểm thấp hơn rõ.
     assert fit_score("bất kỳ", 4.0, audio_seconds=6.0) < 90
+
+
+def test_is_rate_limited_detects_429_variants():
+    assert _is_rate_limited(Exception("429 Quota exceeded for ..."))
+    assert _is_rate_limited(Exception("RESOURCE_EXHAUSTED: too many requests"))
+    assert not _is_rate_limited(Exception("403 PermissionDenied: API disabled"))
+
+
+def test_rate_limiter_enforces_minimum_spacing():
+    limiter = _RateLimiter(min_interval=0.05)
+    start = time.monotonic()
+    limiter.wait()
+    limiter.wait()
+    limiter.wait()
+    elapsed = time.monotonic() - start
+    # 3 lần gọi liên tiếp phải cách nhau tối thiểu 2 * min_interval.
+    assert elapsed >= 0.09

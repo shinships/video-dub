@@ -15,8 +15,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import settings
-from .db import connect, get_job, init_db, list_jobs, now_iso, update_job, update_segment
-from .pipeline import Pipeline, PipelineError, fit_score, probe, seed_demo_job
+from . import service
+from .db import get_job, init_db, list_jobs, update_job, update_segment
+from .pipeline import Pipeline, PipelineError, fit_score, seed_demo_job
 
 
 queues: dict[str, set[asyncio.Queue[dict[str, Any]]]] = defaultdict(set)
@@ -116,37 +117,18 @@ async def create_job(
     metadata = {"duration": 0, "width": 0, "height": 0}
     if settings.ffprobe:
         try:
-            metadata = probe(destination)
+            metadata = service.probe_and_check(destination)
+        except PipelineError as exc:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(422, str(exc)) from exc
         except Exception as exc:
             destination.unlink(missing_ok=True)
             raise HTTPException(422, f"Video không hợp lệ: {exc}") from exc
-        if metadata["duration"] > 1800:
-            destination.unlink(missing_ok=True)
-            raise HTTPException(422, "Video vượt giới hạn 30 phút.")
-    now = now_iso()
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO jobs
-            (id, name, source_path, status, stage, progress, duration, width, height,
-             voice, style, artifacts, cost, created_at, updated_at)
-            VALUES (?, ?, ?, 'queued', 'upload', 3, ?, ?, ?, ?, ?, '{}', '{}', ?, ?)
-            """,
-            (
-                job_id,
-                file.filename or destination.name,
-                str(destination),
-                metadata["duration"],
-                metadata["width"],
-                metadata["height"],
-                voice,
-                style,
-                now,
-                now,
-            ),
-        )
+    job = service.register_job(
+        job_id, file.filename or destination.name, destination, metadata, voice, style
+    )
     await work_queue.put(job_id)
-    return get_job(job_id) or {}
+    return job
 
 
 @app.patch("/api/jobs/{job_id}")
