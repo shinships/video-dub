@@ -1,0 +1,2 @@
+demucs==4.0.1
+faster-whisper==1.1.0
