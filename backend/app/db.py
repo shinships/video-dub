@@ -46,6 +46,7 @@ def init_db() -> None:
                 height INTEGER NOT NULL DEFAULT 0,
                 voice TEXT NOT NULL DEFAULT 'Aoede',
                 style TEXT NOT NULL DEFAULT 'Tự nhiên',
+                tts_engine TEXT,
                 error TEXT,
                 cancelled INTEGER NOT NULL DEFAULT 0,
                 artifacts TEXT NOT NULL DEFAULT '{}',
@@ -76,7 +77,13 @@ def init_db() -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """Thêm cột mới cho DB cũ một cách an toàn (idempotent)."""
     additions = {
-        "jobs": {"speed": "REAL NOT NULL DEFAULT 1.0", "pitch": "REAL NOT NULL DEFAULT 0"},
+        "jobs": {
+            "speed": "REAL NOT NULL DEFAULT 1.0",
+            "pitch": "REAL NOT NULL DEFAULT 0",
+            # NULL = dùng VIDEO_DUB_TTS_ENGINE toàn cục; đặt riêng để job này dùng engine khác
+            # (vd "vieneu" chạy local) mà không đổi cấu hình chung.
+            "tts_engine": "TEXT",
+        },
         "segments": {"audio_duration": "REAL"},
     }
     for table, columns in additions.items():

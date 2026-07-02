@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,6 +73,9 @@ class JobSettingsPatch(BaseModel):
     style: str | None = None
     speed: float | None = Field(default=None, ge=0.5, le=2.0)
     pitch: float | None = Field(default=None, ge=-6, le=6)
+    # Không có trên UI — đặt riêng cho job này để dùng engine khác VIDEO_DUB_TTS_ENGINE
+    # toàn cục (vd chạy "vieneu" cho job A trong khi job B vẫn dùng "gemini").
+    tts_engine: Literal["gemini", "vieneu"] | None = None
 
 
 @app.get("/api/health")
@@ -83,6 +86,7 @@ def health() -> dict[str, Any]:
         "ffmpeg": bool(settings.ffmpeg),
         "ffprobe": bool(settings.ffprobe),
         "cloud_ready": settings.cloud_ready,
+        "tts_engine": settings.tts_engine,
         "gpu": detect_gpu(),
     }
 

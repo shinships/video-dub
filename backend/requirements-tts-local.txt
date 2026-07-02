@@ -1,0 +1,10 @@
+# TTS tiếng Việt chạy local (VIDEO_DUB_TTS_ENGINE=vieneu) — bước tạo giọng không gọi
+# Vertex AI nữa. CPU chạy được (ONNX Runtime); nếu có GPU NVIDIA: pip install "vieneu[gpu]".
+#
+# Lưu ý đã kiểm chứng khi cài thật (vieneu 3.0.11):
+# - vieneu thiếu khai báo transformers trong dependency -> phải liệt kê tường minh ở đây,
+#   không có sẽ lỗi ModuleNotFoundError khi khởi tạo Vieneu().
+# - vieneu kéo theo gradio, nâng fastapi/starlette vượt pin trong requirements-core.txt
+#   (0.115.x -> 0.139.x). Backend + test suite đã xác nhận chạy tốt với fastapi 0.139.
+vieneu>=3.0.11
+transformers>=4.51

@@ -61,6 +61,13 @@ class Settings:
     gcs_bucket: str = os.getenv("VIDEO_DUB_GCS_BUCKET", "")
     gemini_model: str = os.getenv("VIDEO_DUB_GEMINI_MODEL", "gemini-2.5-flash")
     tts_model: str = os.getenv("VIDEO_DUB_TTS_MODEL", "gemini-2.5-flash-tts")
+    # Engine tạo giọng: "gemini" (cloud Vertex AI, mặc định) | "vieneu" (local, miễn phí,
+    # cần cài requirements-tts-local.txt; bước TTS không gọi cloud nữa).
+    tts_engine: str = os.getenv("VIDEO_DUB_TTS_ENGINE", "gemini").lower()
+    # Giọng preset VieNeu (vd "Ngọc Lan"); để trống dùng giọng mặc định của model.
+    vieneu_voice: str = os.getenv("VIDEO_DUB_VIENEU_VOICE", "")
+    # File wav 3-5 giây để nhân bản giọng; nếu đặt sẽ ưu tiên hơn vieneu_voice.
+    vieneu_ref_audio: str = os.getenv("VIDEO_DUB_VIENEU_REF_AUDIO", "")
     stt_model: str = os.getenv("VIDEO_DUB_STT_MODEL", "latest_long")
     # Engine nhận dạng giọng nói: "whisper" (local, mặc định) | "google" (STT V2 batch).
     stt_engine: str = os.getenv("VIDEO_DUB_STT_ENGINE", "whisper").lower()

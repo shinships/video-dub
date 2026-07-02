@@ -208,6 +208,45 @@ def _get_whisper_model(model_name: str):
         return model
 
 
+_vieneu_lock = threading.Lock()
+_vieneu_model: Any = None
+
+
+def vieneu_infer_kwargs(voice: str, ref_audio: str) -> dict[str, str]:
+    """Chọn giọng VieNeu: ưu tiên nhân bản từ ref_audio, rồi preset, trống thì mặc định SDK."""
+    if ref_audio:
+        return {"ref_audio": ref_audio}
+    if voice:
+        return {"voice": voice}
+    return {}
+
+
+def segment_audio_suffix(engine: str) -> str:
+    """Đuôi file audio đoạn theo engine: VieNeu save ra WAV, Gemini trả bytes MP3."""
+    return ".wav" if engine == "vieneu" else ".mp3"
+
+
+def resolve_tts_engine(job: dict[str, Any]) -> str:
+    """Engine của riêng job (đặt qua PATCH /api/jobs) thắng; job không đặt thì dùng
+    VIDEO_DUB_TTS_ENGINE toàn cục -> nhiều job chạy song song có thể khác engine nhau."""
+    return job.get("tts_engine") or settings.tts_engine
+
+
+def _synth_vieneu(text: str, output: Path) -> None:
+    """TTS local bằng VieNeu (không gọi cloud). Giữ lock xuyên suốt nạp + suy luận:
+    model giữ trạng thái nội bộ nên không an toàn khi gọi song song, và suy luận vốn
+    nghẽn CPU — chạy tuần tự không làm chậm thêm so với chạy chồng lên nhau."""
+    global _vieneu_model
+    with _vieneu_lock:
+        if _vieneu_model is None:
+            from vieneu import Vieneu
+
+            _vieneu_model = Vieneu()
+        kwargs = vieneu_infer_kwargs(settings.vieneu_voice, settings.vieneu_ref_audio)
+        audio = _vieneu_model.infer(text, **kwargs)
+        _vieneu_model.save(audio, str(output))
+
+
 def _is_rate_limited(exc: Exception) -> bool:
     """Phát hiện lỗi quota/rate-limit (429 / RESOURCE_EXHAUSTED) từ Google API."""
     name = type(exc).__name__
@@ -796,15 +835,22 @@ class Pipeline:
 
     def _synthesize_segment(self, job_id: str, segment: dict[str, Any]) -> Path:
         job = get_job(job_id, include_segments=False) or {}
-        output = settings.jobs_dir / job_id / f"segment-{segment['position']:04d}.mp3"
+        engine = resolve_tts_engine(job)
+        suffix = segment_audio_suffix(engine)
+        output = settings.jobs_dir / job_id / f"segment-{segment['position']:04d}{suffix}"
         seconds = max(0.5, segment["end"] - segment["start"])
         text = segment["translated_text"]
 
         # Vòng khớp độ dài: nếu TTS dài hơn khung quá ngưỡng thì viết lại ngắn hơn rồi synth lại.
+        # VieNeu không nhận gợi ý thời lượng như Gemini nhưng vòng này (đo thật + viết lại
+        # + atempo lúc render) vẫn khống chế được độ dài cho cả hai engine.
         context = (job.get("artifacts") or {}).get("translate_context", "")
         duration = 0.0
         for attempt in range(FIT_MAX_RETRIES + 1):
-            output.write_bytes(self._tts_bytes(text, job, seconds))
+            if engine == "vieneu":
+                _synth_vieneu(text, output)
+            else:
+                output.write_bytes(self._tts_bytes(text, job, seconds))
             duration = probe_audio(output)
             if duration <= seconds * FIT_TOLERANCE or attempt == FIT_MAX_RETRIES:
                 break

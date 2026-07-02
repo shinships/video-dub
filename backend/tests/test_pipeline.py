@@ -15,6 +15,9 @@ from app.pipeline import (
     _RateLimiter,
     _strip_json,
     fit_score,
+    resolve_tts_engine,
+    segment_audio_suffix,
+    vieneu_infer_kwargs,
 )
 
 
@@ -140,6 +143,27 @@ def test_rate_limiter_enforces_minimum_spacing():
     elapsed = time.monotonic() - start
     # 3 lần gọi liên tiếp phải cách nhau tối thiểu 2 * min_interval.
     assert elapsed >= 0.09
+
+
+def test_segment_audio_suffix_follows_tts_engine():
+    assert segment_audio_suffix("vieneu") == ".wav"
+    assert segment_audio_suffix("gemini") == ".mp3"
+
+
+def test_vieneu_infer_kwargs_prefers_ref_audio_over_preset():
+    # ref_audio (nhân bản giọng) phải thắng preset; trống cả hai -> mặc định SDK.
+    assert vieneu_infer_kwargs("Ngọc Lan", "my.wav") == {"ref_audio": "my.wav"}
+    assert vieneu_infer_kwargs("Ngọc Lan", "") == {"voice": "Ngọc Lan"}
+    assert vieneu_infer_kwargs("", "") == {}
+
+
+def test_resolve_tts_engine_prefers_job_over_global(monkeypatch):
+    # Job đặt riêng engine (qua PATCH /api/jobs, không qua UI) phải thắng cấu hình toàn cục.
+    # settings là dataclass frozen -> patch nguyên tên "settings" trong module thay vì field.
+    monkeypatch.setattr(pipeline_module, "settings", SimpleNamespace(tts_engine="gemini"))
+    assert resolve_tts_engine({"tts_engine": "vieneu"}) == "vieneu"
+    assert resolve_tts_engine({"tts_engine": None}) == "gemini"
+    assert resolve_tts_engine({}) == "gemini"
 
 
 def test_default_job_speed_stays_within_atempo_range():
