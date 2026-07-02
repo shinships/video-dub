@@ -1,9 +1,12 @@
 import json
 import time
+from types import SimpleNamespace
 
+import app.pipeline as pipeline_module
 from app.pipeline import (
     ATEMPO_MAX,
     ATEMPO_MIN,
+    DEFAULT_JOB_SPEED,
     Pipeline,
     _atempo_chain,
     _is_rate_limited,
@@ -137,3 +140,43 @@ def test_rate_limiter_enforces_minimum_spacing():
     elapsed = time.monotonic() - start
     # 3 lần gọi liên tiếp phải cách nhau tối thiểu 2 * min_interval.
     assert elapsed >= 0.09
+
+
+def test_default_job_speed_stays_within_atempo_range():
+    # DEFAULT_JOB_SPEED phải nằm trong biên atempo, nếu không _render sẽ âm thầm kẹp
+    # tốc độ mặc định xuống giá trị khác với những gì cấu hình.
+    assert ATEMPO_MIN <= DEFAULT_JOB_SPEED <= ATEMPO_MAX
+
+
+def test_write_srt_scales_timestamps_by_speed(tmp_path, monkeypatch):
+    # Tua nhanh video (speed) thì mốc thời gian phụ đề cũng phải chia theo speed để
+    # khớp đúng timeline đã bị nén lại của video xuất ra.
+    # settings là dataclass frozen với jobs_dir là property -> không setattr trực tiếp
+    # được; patch nguyên tên "settings" trong module bằng namespace giả gọn hơn.
+    monkeypatch.setattr(pipeline_module, "settings", SimpleNamespace(jobs_dir=tmp_path))
+    (tmp_path / "job-x").mkdir()
+    fake_job = {
+        "segments": [
+            {"start": 0.0, "end": 2.0, "translated_text": "Xin chào"},
+            {"start": 2.0, "end": 4.4, "translated_text": "Tạm biệt"},
+        ]
+    }
+    monkeypatch.setattr(pipeline_module, "get_job", lambda job_id: fake_job)
+
+    pipe = Pipeline(hook=None)
+    srt_path = pipe._write_srt("job-x", speed=1.1)
+    content = srt_path.read_text(encoding="utf-8")
+
+    assert "00:00:00,000 --> 00:00:01,818" in content
+    assert "00:00:01,818 --> 00:00:04,000" in content
+
+
+def test_write_srt_defaults_to_speed_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "settings", SimpleNamespace(jobs_dir=tmp_path))
+    (tmp_path / "job-y").mkdir()
+    fake_job = {"segments": [{"start": 1.0, "end": 3.0, "translated_text": "Câu"}]}
+    monkeypatch.setattr(pipeline_module, "get_job", lambda job_id: fake_job)
+
+    pipe = Pipeline(hook=None)
+    content = pipe._write_srt("job-y").read_text(encoding="utf-8")
+    assert "00:00:01,000 --> 00:00:03,000" in content

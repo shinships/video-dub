@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import settings
 from .db import connect, get_job, now_iso
-from .pipeline import PipelineError, probe
+from .pipeline import DEFAULT_JOB_SPEED, PipelineError, probe
 
 MAX_DURATION_SECONDS = 1800  # 30 phút
 
@@ -78,8 +78,8 @@ def register_job(
             """
             INSERT INTO jobs
             (id, name, source_path, status, stage, progress, duration, width, height,
-             voice, style, artifacts, cost, created_at, updated_at)
-            VALUES (?, ?, ?, 'queued', 'upload', 3, ?, ?, ?, ?, ?, '{}', '{}', ?, ?)
+             voice, style, speed, artifacts, cost, created_at, updated_at)
+            VALUES (?, ?, ?, 'queued', 'upload', 3, ?, ?, ?, ?, ?, ?, '{}', '{}', ?, ?)
             """,
             (
                 job_id,
@@ -90,6 +90,7 @@ def register_job(
                 metadata["height"],
                 voice,
                 style,
+                DEFAULT_JOB_SPEED,
                 now,
                 now,
             ),

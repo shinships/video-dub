@@ -52,6 +52,14 @@ MIX_LIMIT = 0.9  # Trần limiter mix cuối (~-0.9 dB) chống vỡ tiếng.
 # Kẹp tốc độ atempo: chỉ tinh chỉnh nhẹ, phần còn lại do bước viết-lại lo.
 ATEMPO_MIN = 0.9
 ATEMPO_MAX = 1.15
+# Tốc độ output mặc định cho job mới: tua nhanh toàn bộ video (hình + nhạc nền + thoại)
+# 10%, đồng bộ tuyệt đối — không chỉ riêng nhịp đọc giọng lồng tiếng.
+DEFAULT_JOB_SPEED = 1.1
+# Video giữ nguyên tốc độ (copy, nhanh) chỉ khi speed ~= 1.0; khác 1.0 phải re-encode để
+# áp setpts nên cần codec/preset cho nhánh này.
+VIDEO_CODEC = "libx264"
+VIDEO_PRESET = "veryfast"
+VIDEO_CRF = "18"
 
 # --- Tham số dịch ---
 TRANSLATE_BATCH = 40  # Số câu mỗi lời gọi Gemini (dịch theo lô).
@@ -848,7 +856,10 @@ class Pipeline:
         inputs: list[str] = []
         filters: list[str] = []
         labels: list[str] = []
-        speed = float(job.get("speed") or 1.0)
+        # Kẹp cùng biên với atempo: "speed" tua nhanh CẢ video (hình + nền + thoại) nên
+        # phải khớp dải mà atempo còn xử lý mượt, tránh méo tiếng nếu lỡ nhận giá trị lớn.
+        speed = max(ATEMPO_MIN, min(ATEMPO_MAX, float(job.get("speed") or 1.0)))
+        speed_changed = abs(speed - 1.0) > 1e-3
         pitch = float(job.get("pitch") or 0.0)
         pitch_chain = _pitch_chain(pitch)
         for index, segment in enumerate(job["segments"]):
@@ -858,8 +869,10 @@ class Pipeline:
             if duration <= 0:
                 duration = probe_audio(audio_path)
             target = max(0.25, segment["end"] - segment["start"])
+            # Khớp trong khung gốc rồi nhân thêm "speed" để theo kịp timeline đã bị nén lại.
             ratio = duration / target * speed
-            delay = int(segment["start"] * 1000)
+            # Mốc bắt đầu cũng phải chia cho speed để khớp đúng vị trí trên timeline đã tua nhanh.
+            delay = int(segment["start"] / speed * 1000)
             inputs.extend(["-i", str(audio_path)])
             label = f"s{index}"
             filters.append(
@@ -878,14 +891,30 @@ class Pipeline:
         bg_index = len(job["segments"])
         source_index = bg_index + 1
         inputs.extend(["-i", background, "-i", job["source_path"]])
+        # Nhạc nền tua nhanh cùng tỉ lệ "speed" để đồng bộ với hình + thoại (không "khớp
+        # khung" như thoại vì nền là track liên tục, không có target riêng từng đoạn).
+        bg_speed_chain = f",{_atempo_chain(speed)}" if speed_changed else ""
         # Giữ nguyên nền gốc; chỉ ducking (giảm nhẹ) khi có thoại Việt, trả lại đầy đủ khi im.
         filters.append(
-            f"[{bg_index}:a]{AUDIO_FORMAT},volume={BG_VOLUME}[bg0];"
+            f"[{bg_index}:a]{AUDIO_FORMAT},volume={BG_VOLUME}{bg_speed_chain}[bg0];"
             f"[bg0][narr_key]sidechaincompress=threshold={DUCK_THRESHOLD}:ratio={DUCK_RATIO}:"
             f"attack={DUCK_ATTACK}:release={DUCK_RELEASE}[bg_ducked];"
             f"[bg_ducked][narr_mix]amix=inputs=2:normalize=0,"
             f"alimiter=limit={MIX_LIMIT}[mix]"
         )
+        video_args: list[str]
+        if speed_changed:
+            # setpts nén timeline hình theo đúng "speed" -> phải re-encode, không copy được.
+            filters.append(f"[{source_index}:v]setpts=PTS/{speed:.6f}[vout]")
+            video_args = [
+                "-map", "[vout]",
+                "-c:v", VIDEO_CODEC,
+                "-preset", VIDEO_PRESET,
+                "-crf", VIDEO_CRF,
+                "-pix_fmt", "yuv420p",
+            ]
+        else:
+            video_args = ["-map", f"{source_index}:v:0", "-c:v", "copy"]
         run(
             [
                 settings.ffmpeg,
@@ -893,12 +922,9 @@ class Pipeline:
                 *inputs,
                 "-filter_complex",
                 ";".join(filters),
-                "-map",
-                f"{source_index}:v:0",
+                *video_args,
                 "-map",
                 "[mix]",
-                "-c:v",
-                "copy",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -908,16 +934,19 @@ class Pipeline:
             ],
             timeout=7200,
         )
-        self._write_srt(job_id)
+        self._write_srt(job_id, speed)
         return output
 
-    def _write_srt(self, job_id: str) -> Path:
+    def _write_srt(self, job_id: str, speed: float = 1.0) -> Path:
         job = get_job(job_id) or {}
         output = settings.jobs_dir / job_id / "subtitles-vi.srt"
         chunks = []
         for index, segment in enumerate(job["segments"], 1):
+            # Chia cho speed để phụ đề khớp đúng timeline đã tua nhanh của video xuất ra.
+            start = segment["start"] / speed
+            end = segment["end"] / speed
             chunks.append(
-                f"{index}\n{format_srt(segment['start'])} --> {format_srt(segment['end'])}\n"
+                f"{index}\n{format_srt(start)} --> {format_srt(end)}\n"
                 f"{segment['translated_text']}\n"
             )
         output.write_text("\n".join(chunks), encoding="utf-8")

@@ -35,6 +35,8 @@ const fallbackJob = {
   height: 1080,
   voice: "Aoede",
   style: "Tự nhiên",
+  speed: 1.1,
+  pitch: 0,
   cost: { stt: 1680, translation: 2100, tts: 8400, total: 12180 },
   segments: [
     ["In this video, I’m going to share 5 simple productivity tips.", "Trong video này, tôi sẽ chia sẻ 5 mẹo tăng năng suất đơn giản.", 92],
