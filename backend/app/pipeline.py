@@ -936,12 +936,18 @@ class Pipeline:
         filters.append(
             f"{''.join(labels)}amix=inputs={len(labels)}:normalize=0,"
             f"loudnorm=I={NARRATION_LUFS}:TP=-1.5:LRA=11{pitch_chain},{AUDIO_FORMAT},"
-            "asplit=2[narr_mix][narr_key]"
+            "asplit=2[narr_mix][narr_key0]"
         )
         background = job["artifacts"]["background"]
         bg_index = len(job["segments"])
         source_index = bg_index + 1
         inputs.extend(["-i", background, "-i", job["source_path"]])
+        # sidechaincompress cắt output theo độ dài nhánh KHOÁ (sidechain), không phải nhánh
+        # chính — nếu câu thoại cuối kết thúc trước khi video hết (im lặng/outro cuối), khoá
+        # ngắn hơn nền sẽ cắt cụt luôn đoạn nền+hình còn lại. Đệm khoá bằng im lặng cho dài ít
+        # nhất bằng nền (đã theo "speed") để tránh mất đuôi video.
+        bg_target_seconds = probe_audio(Path(background)) / speed
+        filters.append(f"[narr_key0]apad=whole_dur={bg_target_seconds:.3f}[narr_key]")
         # Nhạc nền tua nhanh cùng tỉ lệ "speed" để đồng bộ với hình + thoại (không "khớp
         # khung" như thoại vì nền là track liên tục, không có target riêng từng đoạn).
         bg_speed_chain = f",{_atempo_chain(speed)}" if speed_changed else ""
