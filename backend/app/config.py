@@ -68,6 +68,10 @@ class Settings:
     vieneu_voice: str = os.getenv("VIDEO_DUB_VIENEU_VOICE", "")
     # File wav 3-5 giây để nhân bản giọng; nếu đặt sẽ ưu tiên hơn vieneu_voice.
     vieneu_ref_audio: str = os.getenv("VIDEO_DUB_VIENEU_REF_AUDIO", "")
+    # Mặc định "cpu" (đường ONNX torch-free, đã kiểm chứng ổn định): VieNeu tự dò thấy
+    # CUDA của torch (cài cho Demucs) và cố chạy GPU sẽ đụng cuDNN thiếu symbol trên máy
+    # đã test. Chỉ đổi "cuda" nếu đã xác nhận cuDNN tương thích với torch của dự án.
+    vieneu_device: str = os.getenv("VIDEO_DUB_VIENEU_DEVICE", "cpu")
     stt_model: str = os.getenv("VIDEO_DUB_STT_MODEL", "latest_long")
     # Engine nhận dạng giọng nói: "whisper" (local, mặc định) | "google" (STT V2 batch).
     stt_engine: str = os.getenv("VIDEO_DUB_STT_ENGINE", "whisper").lower()

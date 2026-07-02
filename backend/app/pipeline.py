@@ -87,6 +87,11 @@ def run(command: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[
         check=True,
         capture_output=True,
         text=True,
+        # Không set encoding -> subprocess dùng locale mặc định (cp1252 trên Windows),
+        # crash reader thread nếu subprocess (ffmpeg/demucs) in byte ngoài cp1252 và
+        # nuốt mất log thật của lỗi gốc. Ép UTF-8 + thay thế ký tự lỗi thay vì crash.
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
@@ -241,7 +246,7 @@ def _synth_vieneu(text: str, output: Path) -> None:
         if _vieneu_model is None:
             from vieneu import Vieneu
 
-            _vieneu_model = Vieneu()
+            _vieneu_model = Vieneu(device=settings.vieneu_device)
         kwargs = vieneu_infer_kwargs(settings.vieneu_voice, settings.vieneu_ref_audio)
         audio = _vieneu_model.infer(text, **kwargs)
         _vieneu_model.save(audio, str(output))
