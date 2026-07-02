@@ -4,6 +4,7 @@ import time
 from app.pipeline import (
     ATEMPO_MAX,
     ATEMPO_MIN,
+    Pipeline,
     _atempo_chain,
     _is_rate_limited,
     _parse_translations,
@@ -56,6 +57,62 @@ def test_parse_translations_handles_array_and_wrapped():
     assert _parse_translations(wrapped) == {5: "năm"}
 
     assert _parse_translations("not json") == {}
+
+
+def test_parse_translations_skips_bad_index_and_empty_text():
+    payload = json.dumps(
+        [
+            {"index": "rác", "vi": "bị bỏ"},
+            {"index": 2, "vi": "   "},
+            {"index": 3, "vi": "hợp lệ"},
+        ]
+    )
+    # Index không phải số và bản dịch rỗng phải bị loại để vòng dịch-lại xử lý.
+    assert _parse_translations(payload) == {3: "hợp lệ"}
+
+
+def _make_segments(count: int) -> list[dict]:
+    return [
+        {"text": f"sentence {i}", "start": float(i), "end": float(i + 1)} for i in range(count)
+    ]
+
+
+def test_translate_retries_missing_indices(monkeypatch):
+    pipe = Pipeline(hook=None)
+    monkeypatch.setattr(pipe, "_genai_client", lambda: object())
+    monkeypatch.setattr(pipe, "_build_context", lambda client, segs: "ngữ cảnh")
+    calls: list[list[int]] = []
+
+    def fake_chunk(client, indices, all_segments, style, context):
+        calls.append(list(indices))
+        if len(calls) == 1:
+            return {0: "không", 2: "hai"}  # bỏ sót index 1
+        return {1: "một"}
+
+    monkeypatch.setattr(pipe, "_translate_chunk", fake_chunk)
+    translated, context = pipe._translate(_make_segments(3), "tự nhiên")
+    assert context == "ngữ cảnh"
+    assert [item["translated"] for item in translated] == ["không", "một", "hai"]
+    # Lượt dịch-lại chỉ gửi đúng các index còn thiếu.
+    assert calls[1] == [1]
+
+
+def test_translate_falls_back_to_english_when_retry_fails(monkeypatch):
+    pipe = Pipeline(hook=None)
+    monkeypatch.setattr(pipe, "_genai_client", lambda: object())
+    monkeypatch.setattr(pipe, "_build_context", lambda client, segs: "")
+    calls: list[list[int]] = []
+
+    def fake_chunk(client, indices, all_segments, style, context):
+        calls.append(list(indices))
+        if len(calls) == 1:
+            return {0: "không"}
+        raise RuntimeError("lỗi mạng")
+
+    monkeypatch.setattr(pipe, "_translate_chunk", fake_chunk)
+    translated, _context = pipe._translate(_make_segments(2), "tự nhiên")
+    # Lượt dịch-lại lỗi -> giữ nguyên tiếng Anh thay vì làm hỏng cả job.
+    assert [item["translated"] for item in translated] == ["không", "sentence 1"]
 
 
 def test_fit_score_prefers_real_audio_duration():

@@ -56,6 +56,8 @@ ATEMPO_MAX = 1.15
 # --- Tham số dịch ---
 TRANSLATE_BATCH = 40  # Số câu mỗi lời gọi Gemini (dịch theo lô).
 TRANSLATE_WORKERS = 4  # Số lô dịch song song.
+# Token gcloud sống ~1h; client cache quá hạn này sẽ gọi API bằng token chết giữa chừng.
+CLIENT_TTL_SECONDS = 1800.0
 VI_CHARS_PER_SEC = 15.0  # Ước lượng ký tự tiếng Việt đọc được mỗi giây (khống chế độ dài).
 # --- Tham số khớp độ dài lồng tiếng ---
 FIT_TOLERANCE = 1.15  # TTS dài hơn khung quá tỉ lệ này thì viết lại ngắn hơn.
@@ -173,6 +175,31 @@ class _RateLimiter:
 _tts_limiter = _RateLimiter(TTS_MIN_INTERVAL_SECONDS)
 
 
+_whisper_lock = threading.Lock()
+_whisper_cache: dict[str, Any] = {}
+
+
+def _load_whisper_model(model_name: str):
+    from faster_whisper import WhisperModel
+
+    try:
+        return WhisperModel(model_name, device="cuda", compute_type=settings.whisper_compute)
+    except Exception:
+        return WhisperModel(model_name, device="cpu", compute_type="int8")
+
+
+def _get_whisper_model(model_name: str):
+    """Cache model Whisper giữa các job trong cùng tiến trình. Nạp model 'medium' mất
+    hàng chục giây (đọc file model + khởi tạo CUDA/CPU context); job chạy tuần tự qua
+    1 worker (xem main.py work_queue) nên job kế tiếp có thể tái dùng thay vì nạp lại."""
+    with _whisper_lock:
+        model = _whisper_cache.get(model_name)
+        if model is None:
+            model = _load_whisper_model(model_name)
+            _whisper_cache[model_name] = model
+        return model
+
+
 def _is_rate_limited(exc: Exception) -> bool:
     """Phát hiện lỗi quota/rate-limit (429 / RESOURCE_EXHAUSTED) từ Google API."""
     name = type(exc).__name__
@@ -228,7 +255,13 @@ def _parse_translations(text: str) -> dict[int, str]:
     for row in data if isinstance(data, list) else []:
         if isinstance(row, dict) and "index" in row and ("vi" in row or "translated" in row):
             value = row.get("vi", row.get("translated", ""))
-            mapping[int(row["index"])] = str(value).strip()
+            try:
+                index = int(row["index"])
+            except (TypeError, ValueError):
+                continue  # index rác từ model -> bỏ, để vòng dịch-lại xử lý câu thiếu
+            text = str(value).strip()
+            if text:
+                mapping[index] = text
     return mapping
 
 
@@ -303,6 +336,19 @@ def seed_demo_job(job_id: str = "demo") -> dict[str, Any]:
 class Pipeline:
     def __init__(self, hook: EventHook):
         self.hook = hook
+        # Cache client Google theo instance: tạo client mỗi lần gọi vừa chậm vừa tốn 1 lần
+        # `gcloud auth print-access-token` (subprocess ~1-2s) khi dùng gcloud auth.
+        self._client_lock = threading.Lock()
+        self._cached_clients: dict[str, tuple[Any, float]] = {}
+
+    def _cached_client(self, key: str, factory: Callable[[], Any]) -> Any:
+        with self._client_lock:
+            cached = self._cached_clients.get(key)
+            if cached and time.monotonic() - cached[1] < CLIENT_TTL_SECONDS:
+                return cached[0]
+            client = factory()
+            self._cached_clients[key] = (client, time.monotonic())
+            return client
 
     async def process(self, job_id: str) -> None:
         try:
@@ -353,19 +399,18 @@ class Pipeline:
         audio = work / "source.wav"
         run([settings.ffmpeg, "-y", "-i", str(source), "-vn", "-ac", "2", "-ar", "44100", str(audio)])
         background, vocals = self._separate(audio, work)
-        update_job(
-            job_id,
-            artifacts={"source_audio": str(audio), "background": str(background), "vocals": str(vocals)},
-            stage="transcribe",
-            progress=35,
-        )
+        artifacts = {"source_audio": str(audio), "background": str(background), "vocals": str(vocals)}
+        update_job(job_id, artifacts=artifacts, stage="transcribe", progress=35)
         try:
             transcripts = self._transcribe(vocals, job_id)
         except PipelineError as exc:
             if "Không phát hiện" not in str(exc):
                 raise
             transcripts = self._transcribe(audio, job_id)
-        translated = self._translate(transcripts, job.get("style", "tự nhiên"))
+        translated, context = self._translate(transcripts, job.get("style", "tự nhiên"))
+        if context:
+            # Lưu hướng dẫn dịch để bước viết-lại lúc export giữ đúng glossary/xưng hô.
+            update_job(job_id, artifacts={**artifacts, "translate_context": context})
         self._replace_segments(
             job_id,
             [(item["text"], item["translated"]) for item in translated],
@@ -434,18 +479,11 @@ class Pipeline:
 
     def _transcribe_whisper(self, vocals: Path) -> list[dict[str, Any]]:
         """STT local bằng faster-whisper (nhanh, miễn phí, không cần GCS)."""
-        from faster_whisper import WhisperModel
-
-        device = "cuda"
-        try:
-            model = WhisperModel(
-                settings.whisper_model, device=device, compute_type=settings.whisper_compute
-            )
-        except Exception:
-            device = "cpu"
-            model = WhisperModel(settings.whisper_model, device=device, compute_type="int8")
+        model = _get_whisper_model(settings.whisper_model)
+        # word_timestamps=False: chỉ dùng start/end cấp đoạn, không đọc seg.words -> tắt để
+        # bỏ hẳn pass căn chỉnh từng từ (DTW trên cross-attention), giảm thời gian STT.
         segments, _info = model.transcribe(
-            str(vocals), language="en", vad_filter=True, word_timestamps=True
+            str(vocals), language="en", vad_filter=True, word_timestamps=False
         )
         output: list[dict[str, Any]] = []
         for seg in segments:
@@ -505,11 +543,22 @@ class Pipeline:
     def _genai_client(self):
         from google import genai
 
-        return genai.Client(
-            vertexai=True,
-            credentials=_active_gcloud_credentials(),
-            project=settings.google_project,
-            location=settings.google_region,
+        return self._cached_client(
+            "genai",
+            lambda: genai.Client(
+                vertexai=True,
+                credentials=_active_gcloud_credentials(),
+                project=settings.google_project,
+                location=settings.google_region,
+            ),
+        )
+
+    def _tts_client(self):
+        from google.cloud import texttospeech
+
+        return self._cached_client(
+            "tts",
+            lambda: texttospeech.TextToSpeechClient(credentials=_active_gcloud_credentials()),
         )
 
     def _build_context(self, client, segments: list[dict[str, Any]]) -> str:
@@ -518,10 +567,14 @@ class Pipeline:
 
         transcript = " ".join(item["text"] for item in segments)[:12000]
         prompt = (
-            "Đọc transcript tiếng Anh và viết NGẮN GỌN bằng tiếng Việt để hỗ trợ dịch nhất quán:\n"
+            "Đọc transcript tiếng Anh và soạn NGẮN GỌN bằng tiếng Việt bản HƯỚNG DẪN DỊCH "
+            "dùng chung cho mọi phần của video (các phần được dịch song song nên hướng dẫn "
+            "phải đủ để giữ nhất quán):\n"
             "- Chủ đề & bối cảnh (1-2 câu).\n"
-            "- Glossary: thuật ngữ/tên riêng quan trọng kèm cách dịch hoặc giữ nguyên khuyến nghị.\n"
-            "- Văn phong nên dùng.\n\n"
+            "- Glossary: mỗi dòng một mục dạng `EN => VI` cho thuật ngữ/tên riêng xuất hiện "
+            "nhiều lần; ghi `EN => giữ nguyên` nếu không nên dịch.\n"
+            "- Xưng hô: chọn DUY NHẤT một cặp đại từ (vd `tôi – bạn`) dùng xuyên suốt.\n"
+            "- Văn phong nên dùng (1 câu).\n\n"
             f"Transcript:\n{transcript}"
         )
         try:
@@ -540,8 +593,7 @@ class Pipeline:
     def _translate_chunk(
         self,
         client,
-        chunk: list[dict[str, Any]],
-        offset: int,
+        indices: list[int],
         all_segments: list[dict[str, Any]],
         style: str,
         context: str,
@@ -549,8 +601,8 @@ class Pipeline:
         from google.genai import types
 
         lines = []
-        for local, item in enumerate(chunk):
-            gi = offset + local
+        for gi in indices:
+            item = all_segments[gi]
             seconds = max(0.5, item["end"] - item["start"])
             lines.append(
                 {
@@ -567,8 +619,10 @@ class Pipeline:
             f"Phong cách: {style}.\n"
             "Quan trọng: mỗi câu dịch phải đọc VỪA trong 'max_seconds' (cố gắng không quá 'max_chars' "
             "ký tự) mà vẫn giữ đủ ý — ưu tiên câu gọn, lược từ đệm thừa thay vì cắt nội dung.\n"
-            "Dùng prev/next context để giữ mạch, đại từ và thuật ngữ nhất quán. Bám theo glossary.\n\n"
-            f"--- Bối cảnh & glossary ---\n{context}\n\n"
+            "Dùng prev/next context để giữ mạch, đại từ và thuật ngữ nhất quán.\n"
+            "BẮT BUỘC tuân theo hướng dẫn dịch bên dưới: dùng đúng glossary và đúng cặp xưng hô "
+            "đã chọn cho MỌI câu.\n\n"
+            f"--- Hướng dẫn dịch (bối cảnh, glossary, xưng hô) ---\n{context}\n\n"
             f"--- Câu cần dịch (JSON) ---\n{json.dumps(lines, ensure_ascii=False)}\n\n"
             'Trả về DUY NHẤT một JSON array, mỗi phần tử {"index": <int>, "vi": "<bản dịch>"}.'
         )
@@ -577,7 +631,8 @@ class Pipeline:
                 model=settings.gemini_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.3,
+                    # Nhiệt thấp để cùng thuật ngữ cho ra cùng bản dịch giữa các lô song song.
+                    temperature=0.2,
                     response_mime_type="application/json",
                 ),
             ),
@@ -585,27 +640,40 @@ class Pipeline:
         )
         return _parse_translations(response.text)
 
-    def _translate(self, segments: list[dict[str, Any]], style: str = "tự nhiên") -> list[dict[str, Any]]:
+    def _translate(
+        self, segments: list[dict[str, Any]], style: str = "tự nhiên"
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Dịch toàn bộ segments; trả (kết quả, hướng dẫn dịch) để tái dùng khi viết-lại lúc export."""
         if not segments:
-            return []
+            return [], ""
         client = self._genai_client()
         context = self._build_context(client, segments)
         offsets = list(range(0, len(segments), TRANSLATE_BATCH))
         results: dict[int, str] = {}
 
         def work(offset: int) -> dict[int, str]:
-            chunk = segments[offset : offset + TRANSLATE_BATCH]
-            return self._translate_chunk(client, chunk, offset, segments, style, context)
+            indices = list(range(offset, min(offset + TRANSLATE_BATCH, len(segments))))
+            return self._translate_chunk(client, indices, segments, style, context)
 
         with ThreadPoolExecutor(max_workers=min(TRANSLATE_WORKERS, len(offsets))) as pool:
             for mapping in pool.map(work, offsets):
                 results.update(mapping)
 
-        # Fallback: câu nào model bỏ sót thì giữ nguyên tiếng Anh để không mất đoạn.
+        # Dịch lại một lượt các câu model bỏ sót (JSON hỏng/thiếu index) trước khi chấp nhận
+        # fallback — giữ nguyên tiếng Anh giữa video lộ rõ hơn nhiều so với một lời gọi thêm.
+        missing = [index for index in range(len(segments)) if not results.get(index)]
+        for offset in range(0, len(missing), TRANSLATE_BATCH):
+            batch = missing[offset : offset + TRANSLATE_BATCH]
+            try:
+                results.update(self._translate_chunk(client, batch, segments, style, context))
+            except Exception:
+                break  # phần còn thiếu rơi xuống fallback tiếng Anh bên dưới
+
+        # Fallback cuối: câu nào vẫn thiếu thì giữ nguyên tiếng Anh để không mất đoạn.
         return [
             {**item, "translated": results.get(index) or item["text"]}
             for index, item in enumerate(segments)
-        ]
+        ], context
 
     def _replace_segments(
         self,
@@ -664,7 +732,7 @@ class Pipeline:
             f"Đọc bằng tiếng Việt, phong cách {job.get('style', 'tự nhiên')}, rõ ràng, "
             f"vừa đúng {seconds:.1f} giây."
         )
-        client = texttospeech.TextToSpeechClient(credentials=_active_gcloud_credentials())
+        client = self._tts_client()
         _tts_limiter.wait()
         response = _with_backoff(
             lambda: client.synthesize_speech(
@@ -683,16 +751,25 @@ class Pipeline:
         )
         return response.audio_content
 
-    def _rewrite_shorter(self, source_en: str, current_vi: str, seconds: float) -> str | None:
+    def _rewrite_shorter(
+        self, source_en: str, current_vi: str, seconds: float, context: str = ""
+    ) -> str | None:
         """Nhờ Gemini viết lại câu Việt ngắn hơn để đọc vừa khung giờ, giữ đủ ý."""
         from google.genai import types
 
         try:
             client = self._genai_client()
+            guide = (
+                f"\n--- Hướng dẫn dịch (BẮT BUỘC giữ đúng glossary và cặp xưng hô) ---\n{context}\n"
+                if context
+                else ""
+            )
             prompt = (
                 "Câu lồng tiếng tiếng Việt sau đọc bị DÀI hơn khung thời gian cho phép. "
                 f"Hãy viết lại NGẮN GỌN hơn để đọc vừa khoảng {seconds:.1f} giây, "
-                "vẫn giữ đủ ý chính và tự nhiên. Chỉ trả về câu tiếng Việt mới.\n"
+                "vẫn giữ đủ ý chính, tự nhiên, không đổi cách xưng hô hay thuật ngữ. "
+                "Chỉ trả về câu tiếng Việt mới.\n"
+                f"{guide}"
                 f"Câu gốc (English): {source_en}\n"
                 f"Bản dịch hiện tại: {current_vi}"
             )
@@ -716,13 +793,14 @@ class Pipeline:
         text = segment["translated_text"]
 
         # Vòng khớp độ dài: nếu TTS dài hơn khung quá ngưỡng thì viết lại ngắn hơn rồi synth lại.
+        context = (job.get("artifacts") or {}).get("translate_context", "")
         duration = 0.0
         for attempt in range(FIT_MAX_RETRIES + 1):
             output.write_bytes(self._tts_bytes(text, job, seconds))
             duration = probe_audio(output)
             if duration <= seconds * FIT_TOLERANCE or attempt == FIT_MAX_RETRIES:
                 break
-            shorter = self._rewrite_shorter(segment["source_text"], text, seconds)
+            shorter = self._rewrite_shorter(segment["source_text"], text, seconds, context)
             if not shorter or shorter == text:
                 break
             text = shorter
@@ -775,7 +853,10 @@ class Pipeline:
         pitch_chain = _pitch_chain(pitch)
         for index, segment in enumerate(job["segments"]):
             audio_path = Path(segment["audio_path"])
-            duration = probe_audio(audio_path)
+            # Dùng độ dài đã đo lúc TTS; chỉ probe lại khi thiếu (mp3 tạo bởi bản cũ).
+            duration = float(segment.get("audio_duration") or 0.0)
+            if duration <= 0:
+                duration = probe_audio(audio_path)
             target = max(0.25, segment["end"] - segment["start"])
             ratio = duration / target * speed
             delay = int(segment["start"] * 1000)
