@@ -21,7 +21,7 @@ def load_env() -> None:
         line = raw_line.strip()
         if line and not line.startswith("#") and "=" in line:
             name, value = line.split("=", 1)
-            os.environ[name.strip()] = value.strip()
+            os.environ.setdefault(name.strip(), value.strip())
     os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
 
@@ -110,7 +110,12 @@ async def main() -> None:
     transcripts = await asyncio.to_thread(pipeline._transcribe, source_audio, args.job_id)
     emit({"stage": "translate", "segments": len(transcripts)})
     update_job(args.job_id, stage="translate", progress=45)
-    translated = await asyncio.to_thread(pipeline._translate, transcripts, job.get("style", "natural"))
+    translated, context = await asyncio.to_thread(
+        pipeline._translate, transcripts, job.get("style", "natural")
+    )
+    if context:
+        current_artifacts = (get_job(args.job_id, include_segments=False) or {}).get("artifacts", {})
+        update_job(args.job_id, artifacts={**current_artifacts, "translate_context": context})
     await asyncio.to_thread(
         pipeline._replace_segments,
         args.job_id,
