@@ -28,7 +28,8 @@ FFmpeg filtergraph: validate bằng input `sine` giả lập + `-f null -` (ví 
      `-i` khớp index dùng trong `filter_complex`, `-map` đúng stream.
    - **Giữ nền gốc**: cảnh báo nếu quay lại `amix` normalize mặc định (chia đôi âm lượng),
      hoặc bỏ ducking/`alimiter`. Đây là yêu cầu sản phẩm số 1.
-   - `atempo` phải nằm trong biên `ATEMPO_MIN..MAX` (không ép tốc độ tới mức méo giọng).
+   - `atempo` từng đoạn = `segment_tempo` (kẹp `1.0..ATEMPO_MAX`, không kéo chậm câu ngắn)
+     × `speed` (kẹp `ATEMPO_MIN..MAX`) — tích tối đa ~1.32, không ép tới mức méo giọng.
 2. **Đồng bộ DB**: cột mới có cả trong `CREATE TABLE` lẫn `_migrate`? Truy vấn khớp schema?
 3. **Phụ thuộc & demo mode**: import nặng (`google.*`, `faster_whisper`, `texttospeech`)
    phải nằm trong hàm, không ở top-level — nếu không sẽ vỡ test/demo mode.

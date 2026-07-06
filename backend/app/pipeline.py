@@ -52,6 +52,8 @@ MIX_LIMIT = 0.9  # Trần limiter mix cuối (~-0.9 dB) chống vỡ tiếng.
 # Kẹp tốc độ atempo: chỉ tinh chỉnh nhẹ, phần còn lại do bước viết-lại lo.
 ATEMPO_MIN = 0.9
 ATEMPO_MAX = 1.15
+# Khe an toàn chừa lại trước câu kế tiếp khi cho câu dài tràn sang khoảng lặng phía sau.
+SPILL_GUARD_SECONDS = 0.12
 # Tốc độ output mặc định cho job mới: tua nhanh toàn bộ video (hình + nhạc nền + thoại)
 # 10%, đồng bộ tuyệt đối — không chỉ riêng nhịp đọc giọng lồng tiếng.
 DEFAULT_JOB_SPEED = 1.1
@@ -67,6 +69,16 @@ TRANSLATE_WORKERS = 4  # Số lô dịch song song.
 # Token gcloud sống ~1h; client cache quá hạn này sẽ gọi API bằng token chết giữa chừng.
 CLIENT_TTL_SECONDS = 1800.0
 VI_CHARS_PER_SEC = 15.0  # Ước lượng ký tự tiếng Việt đọc được mỗi giây (khống chế độ dài).
+# --- Tham số gộp câu (ghép đoạn STT vụn thành câu trọn vẹn trước khi dịch/TTS) ---
+# Whisper hay cắt giữa câu -> dịch từng mảnh thiếu ngữ cảnh + TTS ngắt nghỉ vô duyên + gọi
+# TTS gấp đôi (mỗi call bị giãn cách). Gộp lại giúp cả 3: dịch đủ ý, giọng liền mạch, ít call.
+MERGE_MAX_GAP = 0.6  # Khe lặng tối đa (giây) giữa hai đoạn còn cho phép nối tiếp.
+MERGE_MAX_SECONDS = 12.0  # Trần độ dài một câu gộp để khớp độ dài/TTS vẫn dễ.
+MERGE_MAX_CHARS = 240  # Trần ký tự một câu gộp.
+SENTENCE_END = ".?!…"  # Đoạn trước tận cùng bằng các ký tự này coi như hết câu -> không nối.
+# --- Soát lại nhất quán sau dịch song song (1 lời gọi Gemini) ---
+# Các lô dịch song song nên xưng hô/thuật ngữ có thể trôi giữa lô dù đã có glossary chung.
+REVIEW_MAX_CHARS = 24000  # Vượt trần này thì bỏ soát (phản hồi cho danh sách quá dài kém tin cậy).
 # --- Tham số khớp độ dài lồng tiếng ---
 FIT_TOLERANCE = 1.15  # TTS dài hơn khung quá tỉ lệ này thì viết lại ngắn hơn.
 FIT_MAX_RETRIES = 2
@@ -79,6 +91,11 @@ BACKOFF_BASE_SECONDS = 8.0
 # dồn dập rồi chỉ retry bị động — exponential backoff (tới >4 phút/lần) lãng phí cả cửa sổ
 # quota đã hồi. Giãn cách trước giúp tránh 429 ngay từ đầu thay vì chờ bị từ chối rồi lùi.
 TTS_MIN_INTERVAL_SECONDS = float(os.getenv("VIDEO_DUB_TTS_MIN_INTERVAL", "8"))
+# --- Cắt lặng đầu/đuôi audio TTS trước khi đo độ dài ---
+# Gemini/VieNeu hay đệm 0.1-0.4s im lặng hai đầu -> đo dài giả, kích hoạt viết-lại/tăng tốc
+# oan và gây cảm giác vào câu trễ. Ngưỡng thấp + giữ chút lặng cho êm, tránh cụt phụ âm nhẹ.
+TTS_TRIM_THRESHOLD = "-50dB"
+TTS_TRIM_KEEP = 0.06  # Giây lặng giữ lại mỗi đầu.
 
 
 def run(command: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[str]:
@@ -152,6 +169,16 @@ def _atempo_chain(ratio: float, lo: float = ATEMPO_MIN, hi: float = ATEMPO_MAX) 
         ratio /= 0.5
     parts.append(ratio)
     return ",".join(f"atempo={value:.5f}" for value in parts)
+
+
+def segment_tempo(duration: float, slot: float, avail: float) -> float:
+    """Tempo cho từng câu thoại. KHÔNG kéo chậm câu ngắn để lấp khung (mỗi câu một
+    tốc độ nghe rất không đều); chỉ tăng tốc khi audio dài hơn cả chỗ trống thực tế
+    (khung + khoảng lặng tới câu kế tiếp), và kẹp nhẹ để giọng không méo."""
+    avail = max(slot, avail, 0.25)
+    if duration <= avail:
+        return 1.0
+    return min(ATEMPO_MAX, duration / avail)
 
 
 def _pitch_chain(semitones: float, sample_rate: int = 48000) -> str:
@@ -327,6 +354,40 @@ def fit_score(translated: str, seconds: float, audio_seconds: float | None = Non
         target_chars = max(12, seconds * VI_CHARS_PER_SEC)
         penalty = abs(len(translated) - target_chars) / target_chars * 70
     return max(55, min(99, round(100 - penalty)))
+
+
+def merge_transcripts(
+    segments: list[dict[str, Any]],
+    max_gap: float = MERGE_MAX_GAP,
+    max_seconds: float = MERGE_MAX_SECONDS,
+    max_chars: float = MERGE_MAX_CHARS,
+) -> list[dict[str, Any]]:
+    """Ghép các đoạn STT vụn (Whisper hay cắt giữa câu) thành câu trọn vẹn trước khi dịch/TTS.
+    Nối đoạn kế khi đoạn trước CHƯA hết câu (không tận cùng bằng .?!…), khe lặng nhỏ và câu
+    gộp chưa vượt trần độ dài/ký tự — giúp dịch đủ ngữ cảnh và giọng đọc liền mạch, ít call TTS."""
+    merged: list[dict[str, Any]] = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg["start"])
+        end = max(float(seg["end"]), start)
+        if merged:
+            prev = merged[-1]
+            ends_sentence = prev["text"].rstrip()[-1:] in SENTENCE_END
+            joined_len = len(prev["text"]) + 1 + len(text)
+            fits = (
+                not ends_sentence
+                and (start - prev["end"]) <= max_gap
+                and (end - prev["start"]) <= max_seconds
+                and joined_len <= max_chars
+            )
+            if fits:
+                prev["text"] = f"{prev['text']} {text}"
+                prev["end"] = end
+                continue
+        merged.append({"text": text, "start": start, "end": end})
+    return merged
 
 
 async def _stage(job_id: str, hook: EventHook, stage: str, progress: int, message: str) -> None:
@@ -526,8 +587,12 @@ class Pipeline:
 
     def _transcribe(self, vocals: Path, job_id: str) -> list[dict[str, Any]]:
         if settings.stt_engine == "whisper":
-            return self._transcribe_whisper(vocals)
-        return self._transcribe_google(vocals, job_id)
+            raw = self._transcribe_whisper(vocals)
+        else:
+            raw = self._transcribe_google(vocals, job_id)
+        # Gộp đoạn vụn thành câu trọn vẹn ngay tại đây để mọi luồng gọi _transcribe (pipeline
+        # chuẩn lẫn skip-separation của CLI) đều nhận câu đầy đủ trước khi dịch/TTS.
+        return merge_transcripts(raw)
 
     def _transcribe_whisper(self, vocals: Path) -> list[dict[str, Any]]:
         """STT local bằng faster-whisper (nhanh, miễn phí, không cần GCS)."""
@@ -721,11 +786,68 @@ class Pipeline:
             except Exception:
                 break  # phần còn thiếu rơi xuống fallback tiếng Anh bên dưới
 
+        # Soát lại 1 lượt để dọn lệch nhất quán giữa các lô song song (xưng hô/glossary).
+        results.update(self._review_translations(client, segments, results, context))
+
         # Fallback cuối: câu nào vẫn thiếu thì giữ nguyên tiếng Anh để không mất đoạn.
         return [
             {**item, "translated": results.get(index) or item["text"]}
             for index, item in enumerate(segments)
         ], context
+
+    def _review_translations(
+        self,
+        client,
+        segments: list[dict[str, Any]],
+        translated: dict[int, str],
+        context: str,
+    ) -> dict[int, str]:
+        """Pass soát lại 1 lời gọi: dịch song song nên xưng hô/thuật ngữ có thể trôi giữa các
+        lô dù đã có glossary chung. Gửi toàn bộ bản dịch + hướng dẫn, yêu cầu CHỈ sửa câu lệch
+        nhất quán. Trả map {index: bản sửa}; rỗng nếu không cần sửa / call lỗi / bỏ qua."""
+        if not context:
+            return {}  # Không có glossary/xưng hô chuẩn thì không có mốc để soát.
+        rows = [
+            {"index": index, "vi": translated[index]}
+            for index in range(len(segments))
+            if translated.get(index)
+        ]
+        payload = json.dumps(rows, ensure_ascii=False)
+        if not rows or len(payload) > REVIEW_MAX_CHARS:
+            return {}  # Quá dài -> phản hồi soát kém tin cậy, bỏ qua để không làm hỏng bản tốt.
+        try:
+            from google.genai import types
+
+            prompt = (
+                "Dưới đây là toàn bộ bản dịch tiếng Việt của một video, dịch theo nhiều lô "
+                "song song nên có thể LỆCH NHẤT QUÁN về xưng hô hoặc thuật ngữ giữa các câu.\n"
+                "Dựa vào HƯỚNG DẪN DỊCH, chỉ tìm và sửa những câu dùng SAI cặp xưng hô đã chọn "
+                "hoặc SAI glossary. Giữ nguyên nghĩa, KHÔNG viết lại câu đã đúng.\n\n"
+                f"--- Hướng dẫn dịch ---\n{context}\n\n"
+                f"--- Bản dịch (JSON) ---\n{payload}\n\n"
+                'Trả về DUY NHẤT một JSON array chỉ gồm các câu CẦN sửa, mỗi phần tử '
+                '{"index": <int>, "vi": "<bản sửa>"}. Không câu nào cần sửa thì trả về [].'
+            )
+            response = _with_backoff(
+                lambda: client.models.generate_content(
+                    model=settings.gemini_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                ),
+                label="soát lại bản dịch",
+            )
+        except Exception:
+            return {}  # Soát lại là bước tinh chỉnh; lỗi thì giữ nguyên bản dịch, không làm hỏng job.
+        fixes = _parse_translations(response.text)
+        # Chỉ nhận sửa cho index hợp lệ và thực sự khác bản cũ.
+        return {
+            index: vi
+            for index, vi in fixes.items()
+            if 0 <= index < len(segments) and vi != translated.get(index)
+        }
 
     def _replace_segments(
         self,
@@ -777,12 +899,16 @@ class Pipeline:
             await asyncio.to_thread(self._synthesize_segment, job_id, segment)
         await self.hook(job_id, {"type": "segment", "segment_id": segment_id, "status": "ready"})
 
-    def _tts_bytes(self, text: str, job: dict[str, Any], seconds: float) -> bytes:
+    def _tts_bytes(self, text: str, job: dict[str, Any]) -> bytes:
         from google.cloud import texttospeech
 
+        # Prompt CỐ ĐỊNH cho mọi câu: ép thời lượng theo từng câu ("vừa đúng X giây")
+        # khiến model tự đọc dồn khi khung ngắn, kéo lê khi khung dài — mỗi câu một nhịp.
+        # Khớp độ dài đã có vòng viết-lại + atempo lo; prompt chỉ giữ giọng/nhịp nhất quán.
         prompt = (
             f"Đọc bằng tiếng Việt, phong cách {job.get('style', 'tự nhiên')}, rõ ràng, "
-            f"vừa đúng {seconds:.1f} giây."
+            "tốc độ vừa phải, giữ nhịp đọc đều và ổn định như nhau ở mọi câu, "
+            "tự nhiên như người dẫn chuyện."
         )
         client = self._tts_client()
         _tts_limiter.wait()
@@ -855,7 +981,8 @@ class Pipeline:
             if engine == "vieneu":
                 _synth_vieneu(text, output)
             else:
-                output.write_bytes(self._tts_bytes(text, job, seconds))
+                output.write_bytes(self._tts_bytes(text, job))
+            _trim_silence(output)
             duration = probe_audio(output)
             if duration <= seconds * FIT_TOLERANCE or attempt == FIT_MAX_RETRIES:
                 break
@@ -913,21 +1040,29 @@ class Pipeline:
         speed_changed = abs(speed - 1.0) > 1e-3
         pitch = float(job.get("pitch") or 0.0)
         pitch_chain = _pitch_chain(pitch)
-        for index, segment in enumerate(job["segments"]):
+        segments = job["segments"]
+        bg_seconds = probe_audio(Path(job["artifacts"]["background"]))
+        for index, segment in enumerate(segments):
             audio_path = Path(segment["audio_path"])
             # Dùng độ dài đã đo lúc TTS; chỉ probe lại khi thiếu (mp3 tạo bởi bản cũ).
             duration = float(segment.get("audio_duration") or 0.0)
             if duration <= 0:
                 duration = probe_audio(audio_path)
             target = max(0.25, segment["end"] - segment["start"])
+            # Chỗ trống thực tế kéo dài tới lúc câu kế tiếp bắt đầu (hoặc hết nền nếu là
+            # câu cuối): câu hơi dài được tràn sang khoảng lặng thay vì bị tua nhanh.
+            next_start = segments[index + 1]["start"] if index + 1 < len(segments) else bg_seconds
+            avail = next_start - segment["start"] - SPILL_GUARD_SECONDS
             # Khớp trong khung gốc rồi nhân thêm "speed" để theo kịp timeline đã bị nén lại.
-            ratio = duration / target * speed
+            # Hai thừa số đã kẹp sẵn (tempo ≤ ATEMPO_MAX, speed trong biên) nên nới lo/hi
+            # để tích của chúng không bị kẹp lần nữa làm lệch đồng bộ.
+            ratio = segment_tempo(duration, target, avail) * speed
             # Mốc bắt đầu cũng phải chia cho speed để khớp đúng vị trí trên timeline đã tua nhanh.
             delay = int(segment["start"] / speed * 1000)
             inputs.extend(["-i", str(audio_path)])
             label = f"s{index}"
             filters.append(
-                f"[{index}:a]{AUDIO_FORMAT},{_atempo_chain(ratio)},"
+                f"[{index}:a]{AUDIO_FORMAT},{_atempo_chain(ratio, lo=0.5, hi=2.0)},"
                 f"adelay={delay}|{delay}[{label}]"
             )
             labels.append(f"[{label}]")
@@ -946,7 +1081,7 @@ class Pipeline:
         # chính — nếu câu thoại cuối kết thúc trước khi video hết (im lặng/outro cuối), khoá
         # ngắn hơn nền sẽ cắt cụt luôn đoạn nền+hình còn lại. Đệm khoá bằng im lặng cho dài ít
         # nhất bằng nền (đã theo "speed") để tránh mất đuôi video.
-        bg_target_seconds = probe_audio(Path(background)) / speed
+        bg_target_seconds = bg_seconds / speed
         filters.append(f"[narr_key0]apad=whole_dur={bg_target_seconds:.3f}[narr_key]")
         # Nhạc nền tua nhanh cùng tỉ lệ "speed" để đồng bộ với hình + thoại (không "khớp
         # khung" như thoại vì nền là track liên tục, không có target riêng từng đoạn).
@@ -972,13 +1107,15 @@ class Pipeline:
             ]
         else:
             video_args = ["-map", f"{source_index}:v:0", "-c:v", "copy"]
+        filter_script = work / "filter-complex.txt"
+        filter_script.write_text(";".join(filters), encoding="utf-8")
         run(
             [
                 settings.ffmpeg,
                 "-y",
                 *inputs,
-                "-filter_complex",
-                ";".join(filters),
+                "-filter_complex_script",
+                str(filter_script),
                 *video_args,
                 "-map",
                 "[mix]",
@@ -1008,6 +1145,27 @@ class Pipeline:
             )
         output.write_text("\n".join(chunks), encoding="utf-8")
         return output
+
+
+def _trim_silence(path: Path) -> None:
+    """Cắt lặng đầu/đuôi audio TTS (Gemini/VieNeu hay đệm 0.1-0.4s) để đo độ dài chính xác,
+    tránh kích hoạt viết-lại/tăng tốc oan và bớt cảm giác vào câu trễ. Giữ lại chút lặng hai
+    đầu cho êm. Đuôi trim bằng mẹo areverse (silenceremove chỉ cắt được từ đầu). Lỗi -> giữ
+    nguyên file gốc (bước tinh chỉnh, không được làm hỏng audio đã có)."""
+    if not settings.ffmpeg:
+        return
+    trim = (
+        f"silenceremove=start_periods=1:start_silence={TTS_TRIM_KEEP}:"
+        f"start_threshold={TTS_TRIM_THRESHOLD}:detection=peak,areverse,"
+        f"silenceremove=start_periods=1:start_silence={TTS_TRIM_KEEP}:"
+        f"start_threshold={TTS_TRIM_THRESHOLD}:detection=peak,areverse"
+    )
+    tmp = path.with_name(f"{path.stem}-trim{path.suffix}")
+    try:
+        run([settings.ffmpeg, "-y", "-i", str(path), "-af", trim, str(tmp)])
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
 
 
 def probe_audio(path: Path) -> float:

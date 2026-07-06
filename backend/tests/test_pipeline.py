@@ -15,8 +15,10 @@ from app.pipeline import (
     _RateLimiter,
     _strip_json,
     fit_score,
+    merge_transcripts,
     resolve_tts_engine,
     segment_audio_suffix,
+    segment_tempo,
     vieneu_infer_kwargs,
 )
 
@@ -38,6 +40,32 @@ def test_atempo_chain_clamps_to_safe_range():
 
 def test_atempo_chain_keeps_value_in_range():
     assert _atempo_chain(1.05) == "atempo=1.05000"
+
+
+def test_atempo_chain_custom_bounds_skip_reclamp():
+    # Tích (tempo đoạn × speed) đã kẹp sẵn từng thừa số; biên nới phải giữ nguyên giá trị
+    # thay vì kẹp lần nữa về ATEMPO_MAX làm lệch đồng bộ với timeline đã tua nhanh.
+    assert abs(_tempo_product(_atempo_chain(1.265, lo=0.5, hi=2.0)) - 1.265) < 1e-3
+
+
+def test_segment_tempo_never_slows_short_audio():
+    # Câu ngắn hơn khung phải đọc tốc độ tự nhiên (1.0), không bị kéo chậm để lấp khung —
+    # kéo chậm là nguyên nhân chính khiến nhịp đọc lúc nhanh lúc chậm giữa các câu.
+    assert segment_tempo(2.0, 4.0, 4.0) == 1.0
+    assert segment_tempo(3.9, 4.0, 4.0) == 1.0
+
+
+def test_segment_tempo_spills_into_gap_before_speeding_up():
+    # Câu dài hơn khung nhưng còn khoảng lặng phía sau -> tràn sang, giữ tốc độ tự nhiên.
+    assert segment_tempo(4.8, 4.0, 5.0) == 1.0
+    # Hết chỗ trống mới tăng tốc đúng phần thiếu.
+    assert abs(segment_tempo(4.4, 4.0, 4.0) - 1.1) < 1e-9
+
+
+def test_segment_tempo_clamps_at_atempo_max():
+    assert segment_tempo(8.0, 4.0, 4.0) == ATEMPO_MAX
+    # Khe âm/khoảng chồng lấn không được làm chia cho số âm.
+    assert segment_tempo(1.0, 0.0, -1.0) == ATEMPO_MAX
 
 
 def test_pitch_chain_empty_when_no_shift():
@@ -101,6 +129,79 @@ def test_translate_retries_missing_indices(monkeypatch):
     assert [item["translated"] for item in translated] == ["không", "một", "hai"]
     # Lượt dịch-lại chỉ gửi đúng các index còn thiếu.
     assert calls[1] == [1]
+
+
+def test_merge_transcripts_joins_until_sentence_end():
+    # Whisper cắt giữa câu -> nối các mảnh cho tới khi gặp dấu kết câu, rồi bắt đầu câu mới.
+    segs = [
+        {"text": "In this video", "start": 0.0, "end": 1.5},
+        {"text": "I will show you", "start": 1.6, "end": 3.0},
+        {"text": "three tips.", "start": 3.1, "end": 4.5},
+        {"text": "Let's begin.", "start": 5.0, "end": 6.0},
+    ]
+    merged = merge_transcripts(segs)
+    assert [m["text"] for m in merged] == [
+        "In this video I will show you three tips.",
+        "Let's begin.",
+    ]
+    # Câu gộp giữ mốc đầu của mảnh đầu và mốc cuối của mảnh cuối.
+    assert merged[0]["start"] == 0.0 and merged[0]["end"] == 4.5
+
+
+def test_merge_transcripts_respects_gap_and_caps():
+    # Khe lặng lớn -> không nối dù chưa hết câu.
+    gapped = merge_transcripts(
+        [
+            {"text": "Hello there", "start": 0.0, "end": 1.0},
+            {"text": "friend", "start": 2.5, "end": 3.0},
+        ]
+    )
+    assert [m["text"] for m in gapped] == ["Hello there", "friend"]
+
+    # Trần độ dài buộc tách dù khe nhỏ và chưa hết câu.
+    capped = merge_transcripts(
+        [
+            {"text": "one", "start": 0.0, "end": 1.0},
+            {"text": "two", "start": 1.1, "end": 2.5},
+        ],
+        max_seconds=2.0,
+    )
+    assert [m["text"] for m in capped] == ["one", "two"]
+
+
+def test_merge_transcripts_skips_empty_segments():
+    merged = merge_transcripts(
+        [
+            {"text": "  ", "start": 0.0, "end": 1.0},
+            {"text": "hi", "start": 1.0, "end": 2.0},
+        ]
+    )
+    assert [m["text"] for m in merged] == ["hi"]
+
+
+def test_translate_applies_review_fixes(monkeypatch):
+    # Sau khi dịch, pass soát lại được gọi và bản sửa của nó ghi đè đúng index.
+    pipe = Pipeline(hook=None)
+    monkeypatch.setattr(pipe, "_genai_client", lambda: object())
+    monkeypatch.setattr(pipe, "_build_context", lambda client, segs: "ngữ cảnh")
+    monkeypatch.setattr(
+        pipe,
+        "_translate_chunk",
+        lambda client, indices, all_segments, style, context: {i: f"vi{i}" for i in indices},
+    )
+    monkeypatch.setattr(
+        pipe,
+        "_review_translations",
+        lambda client, segments, translated, context: {1: "vi1-đã-sửa"},
+    )
+    translated, _context = pipe._translate(_make_segments(3), "tự nhiên")
+    assert [item["translated"] for item in translated] == ["vi0", "vi1-đã-sửa", "vi2"]
+
+
+def test_review_translations_skips_without_context():
+    # Không có hướng dẫn dịch (glossary/xưng hô) thì không có mốc để soát -> bỏ qua, không gọi API.
+    pipe = Pipeline(hook=None)
+    assert pipe._review_translations(object(), _make_segments(2), {0: "a", 1: "b"}, "") == {}
 
 
 def test_translate_falls_back_to_english_when_retry_fails(monkeypatch):

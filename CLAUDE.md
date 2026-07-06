@@ -46,16 +46,21 @@ cd backend; ..\.venv\Scripts\python -m pytest -q
 1. `probe` video, ffmpeg tách `source.wav`.
 2. `_separate` (Demucs `--two-stems vocals`) → `no_vocals.wav` (nền) + `vocals.wav`.
 3. `_transcribe` → dispatch theo `settings.stt_engine`: `_transcribe_whisper` (mặc định,
-   local, không cần GCS) hoặc `_transcribe_google` (STT V2 batch qua GCS).
+   local, không cần GCS) hoặc `_transcribe_google` (STT V2 batch qua GCS); rồi
+   `merge_transcripts` **gộp đoạn vụn thành câu trọn vẹn** (theo dấu kết câu + khe lặng, trần
+   `MERGE_*`) để dịch đủ ngữ cảnh, giọng liền mạch và ít call TTS hơn.
 4. `_translate` — **pass ngữ cảnh 1 lần** (`_build_context`: tóm tắt + glossary), rồi
    **dịch theo lô** (`_translate_chunk`, JSON, song song qua `ThreadPoolExecutor`),
-   có khống chế độ dài (giây/ký tự) để khớp lồng tiếng.
+   có khống chế độ dài (giây/ký tự) để khớp lồng tiếng; cuối cùng `_review_translations`
+   **soát lại nhất quán 1 lời gọi** (dọn lệch xưng hô/glossary giữa các lô song song).
 
 `Pipeline.export`:
 5. TTS song song (`asyncio.gather` + `Semaphore(TTS_WORKERS)`) qua `_synthesize_segment`,
    có **vòng khớp độ dài**: đo TTS thật, nếu dài quá `FIT_TOLERANCE` thì `_rewrite_shorter`
-   rồi synth lại (≤ `FIT_MAX_RETRIES`).
-6. `_render` (FFmpeg): mỗi đoạn `atempo` (kẹp `ATEMPO_MIN..MAX`) + `adelay`; bus thoại
+   rồi synth lại (≤ `FIT_MAX_RETRIES`). Trước khi đo, `_trim_silence` cắt lặng đầu/đuôi audio
+   TTS (đo chính xác, bớt vào câu trễ).
+6. `_render` (FFmpeg): mỗi đoạn `atempo` theo `segment_tempo` (không kéo chậm câu ngắn;
+   câu dài tràn sang khoảng lặng trước khi tăng tốc, kẹp `ATEMPO_MAX`) + `adelay`; bus thoại
    chuẩn `-16 LUFS`; **giữ nền gốc bằng ducking động** (`sidechaincompress`); mix cuối qua
    `alimiter`. **KHÔNG** dùng `amix` mặc định cho bước trộn nền+thoại (normalize=1 sẽ chia đôi).
 
