@@ -19,6 +19,8 @@ from app.pipeline import (
     resolve_tts_engine,
     segment_audio_suffix,
     segment_tempo,
+    vbee_read,
+    vbee_request_payload,
     vieneu_infer_kwargs,
 )
 
@@ -249,6 +251,33 @@ def test_rate_limiter_enforces_minimum_spacing():
 def test_segment_audio_suffix_follows_tts_engine():
     assert segment_audio_suffix("vieneu") == ".wav"
     assert segment_audio_suffix("gemini") == ".mp3"
+    # Vbee trả MP3 -> dùng chung nhánh mặc định.
+    assert segment_audio_suffix("vbee") == ".mp3"
+
+
+def test_vbee_request_payload_uses_async_mode():
+    # Gói Vbee thường không mở sync -> luôn async, có webhookUrl bắt buộc dù ta chỉ poll.
+    payload = vbee_request_payload("Xin chào", "hn_female_ngochuyen_full_48k-fhg")
+    assert payload["mode"] == "async"
+    assert payload["text"] == "Xin chào"
+    assert payload["voiceCode"] == "hn_female_ngochuyen_full_48k-fhg"
+    assert payload["outputFormat"] == "mp3"
+    assert payload["webhookUrl"]
+
+
+def test_vbee_read_handles_post_poll_and_error_shapes():
+    # POST trả requestId + PROCESSING (chưa có audio).
+    post = vbee_read({"requestId": "abc", "status": "PROCESSING"})
+    assert post == {"request_id": "abc", "status": "PROCESSING", "audio_link": None, "error": None}
+    # GET tới COMPLETED kèm audioLink; status chuẩn hoá in hoa.
+    done = vbee_read({"requestId": "abc", "status": "completed", "audioLink": "https://x/y"})
+    assert done["status"] == "COMPLETED" and done["audio_link"] == "https://x/y"
+    # Bọc trong "result" (như API voices) vẫn bóc được.
+    wrapped = vbee_read({"result": {"requestId": "z", "status": "PROCESSING"}})
+    assert wrapped["request_id"] == "z"
+    # Lỗi -> lấy message, không có request_id.
+    err = vbee_read({"error": {"code": "BAD_REQUEST", "message": "thiếu webhookUrl"}})
+    assert err["request_id"] is None and err["error"] == "thiếu webhookUrl"
 
 
 def test_vieneu_infer_kwargs_prefers_ref_audio_over_preset():

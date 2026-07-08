@@ -279,6 +279,103 @@ def _synth_vieneu(text: str, output: Path) -> None:
         _vieneu_model.save(audio, str(output))
 
 
+# --- Vbee TTS (cloud tiếng Việt qua HTTP bất đồng bộ) ---
+VBEE_API_URL = "https://api.vbee.vn/v1/tts"
+# Gói tài khoản Vbee thường KHÔNG mở chế độ sync ("This feature is not supported in user
+# package") -> đi đường async: POST nhận requestId, poll GET .../requests/{id} tới COMPLETED
+# rồi tải audioLink. webhookUrl bắt buộc dù ta không dùng webhook (chỉ poll) nên đặt placeholder.
+VBEE_WEBHOOK_PLACEHOLDER = os.getenv("VIDEO_DUB_VBEE_WEBHOOK", "https://example.com/vbee-webhook")
+VBEE_POLL_INTERVAL = 2.0  # Giây giữa mỗi lần poll trạng thái.
+VBEE_POLL_TIMEOUT = 180.0  # Trần chờ một đoạn TTS xong (giây).
+VBEE_HTTP_TIMEOUT = 60.0  # Timeout mỗi HTTP call (giây).
+
+
+def vbee_request_payload(text: str, voice: str) -> dict[str, Any]:
+    """Body POST tạo giọng Vbee ở chế độ async (webhookUrl bắt buộc dù ta chỉ poll)."""
+    return {
+        "text": text,
+        "voiceCode": voice,
+        "outputFormat": "mp3",
+        "mode": "async",
+        "webhookUrl": VBEE_WEBHOOK_PLACEHOLDER,
+    }
+
+
+def vbee_headers() -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {settings.vbee_token}",
+        "App-Id": settings.vbee_app_id,
+    }
+
+
+def vbee_read(data: dict[str, Any]) -> dict[str, Any]:
+    """Bóc các trường cần từ phản hồi Vbee, chịu được cả dạng bọc trong 'result' và lỗi.
+    Trả {request_id, status (in hoa), audio_link, error}."""
+    body = data.get("result") if isinstance(data.get("result"), dict) else data
+    if not isinstance(body, dict):
+        body = {}
+    err = data.get("error") if isinstance(data.get("error"), (dict, str)) else body.get("error")
+    message = err.get("message") if isinstance(err, dict) else (str(err) if err else None)
+    return {
+        "request_id": body.get("requestId") or body.get("request_id"),
+        "status": str(body.get("status") or "").upper(),
+        "audio_link": body.get("audioLink") or body.get("audio_link"),
+        "error": message,
+    }
+
+
+def _vbee_json(resp: Any) -> dict[str, Any]:
+    try:
+        data = resp.json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _synth_vbee(text: str, output: Path) -> None:
+    """TTS tiếng Việt qua Vbee: POST tạo yêu cầu -> poll tới COMPLETED -> tải audioLink.
+    Mỗi đoạn độc lập nên gọi song song thoải mái (khác VieNeu phải giữ lock)."""
+    import httpx
+
+    if not (settings.vbee_app_id and settings.vbee_token):
+        raise PipelineError(
+            "Thiếu App ID/token Vbee (đặt VIDEO_DUB_VBEE_APP_ID và VIDEO_DUB_VBEE_TOKEN)."
+        )
+    headers = vbee_headers()
+    payload = vbee_request_payload(text, settings.vbee_voice)
+    # follow_redirects: audioLink (vbee.vn/s/…) chuyển hướng sang S3 mới ra file thật.
+    with httpx.Client(timeout=VBEE_HTTP_TIMEOUT, follow_redirects=True) as client:
+        info = vbee_read(_vbee_json(client.post(VBEE_API_URL, headers=headers, json=payload)))
+        request_id = info["request_id"]
+        if not request_id:
+            raise PipelineError(f"Vbee từ chối tạo giọng: {info['error'] or 'không rõ lỗi'}")
+
+        deadline = time.monotonic() + VBEE_POLL_TIMEOUT
+        audio_link: str | None = None
+        while True:
+            time.sleep(VBEE_POLL_INTERVAL)
+            info = vbee_read(
+                _vbee_json(client.get(f"{VBEE_API_URL}/requests/{request_id}", headers=headers))
+            )
+            if info["status"] == "COMPLETED" and info["audio_link"]:
+                audio_link = info["audio_link"]
+                break
+            # Response FAILED của Vbee chỉ trả {"error": {...}}, KHÔNG kèm trường status ->
+            # phải coi mọi phản hồi có error là lỗi kết thúc, nếu không sẽ poll tới timeout oan.
+            if info["status"] == "FAILED" or info["error"]:
+                raise PipelineError(f"Vbee tạo giọng thất bại: {info['error'] or 'FAILED'}")
+            if time.monotonic() > deadline:
+                raise PipelineError(
+                    f"Vbee quá thời gian chờ ({VBEE_POLL_TIMEOUT:.0f}s) cho một đoạn TTS."
+                )
+
+        audio = client.get(audio_link)
+        if audio.status_code >= 400 or not audio.content:
+            raise PipelineError("Không tải được audio Vbee từ audioLink.")
+        output.write_bytes(audio.content)
+
+
 def _is_rate_limited(exc: Exception) -> bool:
     """Phát hiện lỗi quota/rate-limit (429 / RESOURCE_EXHAUSTED) từ Google API."""
     name = type(exc).__name__
@@ -980,6 +1077,8 @@ class Pipeline:
         for attempt in range(FIT_MAX_RETRIES + 1):
             if engine == "vieneu":
                 _synth_vieneu(text, output)
+            elif engine == "vbee":
+                _synth_vbee(text, output)
             else:
                 output.write_bytes(self._tts_bytes(text, job))
             _trim_silence(output)

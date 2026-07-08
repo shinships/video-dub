@@ -75,7 +75,7 @@ class JobSettingsPatch(BaseModel):
     pitch: float | None = Field(default=None, ge=-6, le=6)
     # Không có trên UI — đặt riêng cho job này để dùng engine khác VIDEO_DUB_TTS_ENGINE
     # toàn cục (vd chạy "vieneu" cho job A trong khi job B vẫn dùng "gemini").
-    tts_engine: Literal["gemini", "vieneu"] | None = None
+    tts_engine: Literal["gemini", "vieneu", "vbee"] | None = None
 
 
 @app.get("/api/health")

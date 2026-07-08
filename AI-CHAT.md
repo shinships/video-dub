@@ -23,7 +23,7 @@ thân app "Lồng Tiếng AI" — không hoạt động nếu chỉ mở UI mà 
 
 | Muốn gì | Field | Giá trị hợp lệ | Ghi chú |
 |---|---|---|---|
-| Đổi engine TTS cho **một job cụ thể** mà không đổi cấu hình chung | `tts_engine` trên job (qua `PATCH /api/jobs/{id}`) | `"gemini"` \| `"vieneu"` \| bỏ trống (dùng mặc định toàn cục `VIDEO_DUB_TTS_ENGINE`) | Cho phép nhiều job chạy song song với engine khác nhau — vd job A dùng VieNeu (local, miễn phí), job B dùng Gemini (cloud). Xem [pipeline.py `resolve_tts_engine`](backend/app/pipeline.py). |
+| Đổi engine TTS cho **một job cụ thể** mà không đổi cấu hình chung | `tts_engine` trên job (qua `PATCH /api/jobs/{id}`) | `"gemini"` \| `"vieneu"` \| `"vbee"` \| bỏ trống (dùng mặc định toàn cục `VIDEO_DUB_TTS_ENGINE`) | Cho phép nhiều job chạy song song với engine khác nhau — vd job A dùng VieNeu (local, miễn phí), job B dùng Gemini (cloud), job C dùng Vbee (cloud VN). Xem [pipeline.py `resolve_tts_engine`](backend/app/pipeline.py). |
 
 Ví dụ yêu cầu trong chat:
 

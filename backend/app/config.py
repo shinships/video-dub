@@ -62,8 +62,14 @@ class Settings:
     gemini_model: str = os.getenv("VIDEO_DUB_GEMINI_MODEL", "gemini-2.5-flash")
     tts_model: str = os.getenv("VIDEO_DUB_TTS_MODEL", "gemini-2.5-flash-tts")
     # Engine tạo giọng: "gemini" (cloud Vertex AI, mặc định) | "vieneu" (local, miễn phí,
-    # cần cài requirements-tts-local.txt; bước TTS không gọi cloud nữa).
+    # cần cài requirements-tts-local.txt; bước TTS không gọi cloud nữa) | "vbee" (cloud VN,
+    # giọng tiếng Việt tự nhiên, gọi HTTP bất đồng bộ; cần App ID + token studio Vbee).
     tts_engine: str = os.getenv("VIDEO_DUB_TTS_ENGINE", "gemini").lower()
+    # Vbee TTS — App ID và token lấy trong studio Vbee (không hard-code, đọc từ env).
+    vbee_app_id: str = os.getenv("VIDEO_DUB_VBEE_APP_ID", "")
+    vbee_token: str = os.getenv("VIDEO_DUB_VBEE_TOKEN", "")
+    # voiceCode Vbee (vd "hn_female_ngochuyen_full_48k-fhg"); xem danh sách qua API voices.
+    vbee_voice: str = os.getenv("VIDEO_DUB_VBEE_VOICE", "hn_female_ngochuyen_full_48k-fhg")
     # Giọng preset VieNeu (vd "Ngọc Lan"); để trống dùng giọng mặc định của model.
     vieneu_voice: str = os.getenv("VIDEO_DUB_VIENEU_VOICE", "")
     # File wav 3-5 giây để nhân bản giọng; nếu đặt sẽ ưu tiên hơn vieneu_voice.
