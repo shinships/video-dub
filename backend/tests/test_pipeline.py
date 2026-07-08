@@ -151,11 +151,11 @@ def test_merge_transcripts_joins_until_sentence_end():
 
 
 def test_merge_transcripts_respects_gap_and_caps():
-    # Khe lặng lớn -> không nối dù chưa hết câu.
+    # Khe lặng vượt cả ngưỡng nối câu (chữ thường) -> không nối dù chưa hết câu.
     gapped = merge_transcripts(
         [
             {"text": "Hello there", "start": 0.0, "end": 1.0},
-            {"text": "friend", "start": 2.5, "end": 3.0},
+            {"text": "friend", "start": 3.0, "end": 3.5},
         ]
     )
     assert [m["text"] for m in gapped] == ["Hello there", "friend"]
@@ -169,6 +169,29 @@ def test_merge_transcripts_respects_gap_and_caps():
         max_seconds=2.0,
     )
     assert [m["text"] for m in capped] == ["one", "two"]
+
+
+def test_merge_transcripts_joins_lowercase_continuation_across_wide_gap():
+    # Người dẫn ngừng lâu (1.3s) để nhấn GIỮA câu; mảnh kế viết thường -> vẫn là cùng câu,
+    # phải nối để tránh "ngắt quãng trong 1 câu" (khe lặng rơi vào giữa câu lúc render).
+    merged = merge_transcripts(
+        [
+            {"text": "The most important thing", "start": 0.0, "end": 1.4},
+            {"text": "is to stay consistent.", "start": 2.7, "end": 4.2},
+        ]
+    )
+    assert [m["text"] for m in merged] == ["The most important thing is to stay consistent."]
+
+
+def test_merge_transcripts_keeps_new_sentence_after_wide_gap():
+    # Cùng khe lặng rộng nhưng mảnh kế VIẾT HOA đầu (câu mới) -> giữ tách, không nối nhầm.
+    merged = merge_transcripts(
+        [
+            {"text": "The system works", "start": 0.0, "end": 1.4},
+            {"text": "Next we configure it.", "start": 2.7, "end": 4.2},
+        ]
+    )
+    assert [m["text"] for m in merged] == ["The system works", "Next we configure it."]
 
 
 def test_merge_transcripts_skips_empty_segments():
