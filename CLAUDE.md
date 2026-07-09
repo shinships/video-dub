@@ -46,9 +46,11 @@ cd backend; ..\.venv\Scripts\python -m pytest -q
 1. `probe` video, ffmpeg tách `source.wav`.
 2. `_separate` (Demucs `--two-stems vocals`) → `no_vocals.wav` (nền) + `vocals.wav`.
 3. `_transcribe` → dispatch theo `settings.stt_engine`: `_transcribe_whisper` (mặc định,
-   local, không cần GCS) hoặc `_transcribe_google` (STT V2 batch qua GCS); rồi
-   `merge_transcripts` **gộp đoạn vụn thành câu trọn vẹn** (theo dấu kết câu + khe lặng, trần
-   `MERGE_*`) để dịch đủ ngữ cảnh, giọng liền mạch và ít call TTS hơn.
+   local, không cần GCS, `word_timestamps=True`) hoặc `_transcribe_google` (STT V2 batch qua
+   GCS); rồi `split_sentences` **tách mảnh STT tại ranh giới câu theo mốc từng từ** (mảnh
+   Whisper ~10s hay đứt giữa câu) và `merge_transcripts` **gộp các mẩu thành câu trọn vẹn**
+   (theo dấu kết câu + khe lặng, trần `MERGE_*`) để dịch đủ ngữ cảnh, giọng liền mạch và ít
+   call TTS hơn.
 4. `_translate` — **pass ngữ cảnh 1 lần** (`_build_context`: tóm tắt + glossary), rồi
    **dịch theo lô** (`_translate_chunk`, JSON, song song qua `ThreadPoolExecutor`),
    có khống chế độ dài (giây/ký tự) để khớp lồng tiếng; cuối cùng `_review_translations`

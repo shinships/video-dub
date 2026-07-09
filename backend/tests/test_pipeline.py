@@ -17,6 +17,7 @@ from app.pipeline import (
     resolve_tts_engine,
     segment_audio_suffix,
     segment_tempo,
+    split_sentences,
     vbee_read,
     vbee_request_payload,
     vieneu_infer_kwargs,
@@ -190,6 +191,80 @@ def test_merge_transcripts_keeps_new_sentence_after_wide_gap():
         ]
     )
     assert [m["text"] for m in merged] == ["The system works", "Next we configure it."]
+
+
+def test_split_sentences_cuts_fragment_at_sentence_boundary():
+    # Mảnh Whisper chứa 2 câu (đứt giữa câu sau) -> tách đúng ranh giới theo mốc từng từ.
+    frag = {
+        "text": "I moved here. My whole plan",
+        "start": 0.0,
+        "end": 2.4,
+        "words": [
+            {"text": "I", "start": 0.0, "end": 0.2},
+            {"text": "moved", "start": 0.2, "end": 0.6},
+            {"text": "here.", "start": 0.6, "end": 1.0},
+            {"text": "My", "start": 1.4, "end": 1.6},
+            {"text": "whole", "start": 1.6, "end": 2.0},
+            {"text": "plan", "start": 2.0, "end": 2.4},
+        ],
+    }
+    pieces = split_sentences([frag])
+    assert [p["text"] for p in pieces] == ["I moved here.", "My whole plan"]
+    # Mốc thời gian lấy từ từ đầu/cuối của từng câu để render đặt đúng vị trí.
+    assert pieces[0]["end"] == 1.0 and pieces[1]["start"] == 1.4
+
+
+def test_split_sentences_keeps_abbreviation_before_lowercase():
+    # Dấu chấm của viết tắt ("e.g.") theo sau bởi chữ thường -> chưa hết câu, không tách.
+    frag = {
+        "text": "e.g. we scaled.",
+        "start": 0.0,
+        "end": 1.2,
+        "words": [
+            {"text": "e.g.", "start": 0.0, "end": 0.4},
+            {"text": "we", "start": 0.5, "end": 0.7},
+            {"text": "scaled.", "start": 0.7, "end": 1.2},
+        ],
+    }
+    assert [p["text"] for p in split_sentences([frag])] == ["e.g. we scaled."]
+
+
+def test_split_sentences_passthrough_without_words():
+    # Mảnh không có word timestamps (STT cũ/fallback) giữ nguyên, không đổi hành vi.
+    frag = {"text": "Hello there", "start": 0.0, "end": 1.0}
+    assert split_sentences([frag]) == [{"text": "Hello there", "start": 0.0, "end": 1.0}]
+
+
+def test_split_then_merge_rebuilds_sentences_across_fragments():
+    # Mảnh 1 đứt giữa câu, mảnh 2 chứa phần còn lại + một câu mới: sau tách + gộp phải ra
+    # đúng 2 câu trọn vẹn — đây là lỗi "ngắt quãng giữa câu" khi mảnh ~10s chạm trần gộp.
+    frags = [
+        {
+            "text": "It started why it",
+            "start": 0.0,
+            "end": 2.0,
+            "words": [
+                {"text": "It", "start": 0.0, "end": 0.3},
+                {"text": "started", "start": 0.3, "end": 0.9},
+                {"text": "why", "start": 0.9, "end": 1.3},
+                {"text": "it", "start": 1.3, "end": 2.0},
+            ],
+        },
+        {
+            "text": "grew. So I built it.",
+            "start": 2.1,
+            "end": 5.0,
+            "words": [
+                {"text": "grew.", "start": 2.1, "end": 2.6},
+                {"text": "So", "start": 3.0, "end": 3.2},
+                {"text": "I", "start": 3.2, "end": 3.3},
+                {"text": "built", "start": 3.3, "end": 3.7},
+                {"text": "it.", "start": 3.7, "end": 5.0},
+            ],
+        },
+    ]
+    merged = pipeline_module.merge_transcripts(split_sentences(frags))
+    assert [m["text"] for m in merged] == ["It started why it grew.", "So I built it."]
 
 
 def test_merge_transcripts_skips_empty_segments():

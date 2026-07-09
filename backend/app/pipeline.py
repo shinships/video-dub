@@ -80,8 +80,11 @@ MERGE_MAX_GAP = 1.0  # Khe lặng tối đa (giây) mặc định còn cho phép
 # chắn là phần nối của cùng câu (STT tiếng Anh viết hoa đầu câu) -> nới khe lặng cho phép để
 # không tách giữa câu, kể cả khi người dẫn ngừng lâu để nhấn.
 MERGE_CONTINUATION_GAP = 1.6  # Khe lặng tối đa khi mảnh kế mở đầu bằng chữ thường (nối câu).
-MERGE_MAX_SECONDS = 12.0  # Trần độ dài một câu gộp để khớp độ dài/TTS vẫn dễ.
-MERGE_MAX_CHARS = 240  # Trần ký tự một câu gộp.
+# merge_transcripts chỉ nối khi mảnh trước CHƯA hết câu, nên trần dưới đây bị chạm nghĩa là
+# đang buộc tách GIỮA một câu — chính là lỗi "ngắt quãng trong 1 câu". Đặt cao hơn độ dài
+# câu nói thực tế (quan sát tới ~20s) để trần chỉ còn là chốt an toàn cho run-on không dấu câu.
+MERGE_MAX_SECONDS = 24.0  # Trần độ dài một câu gộp (chốt an toàn, hiếm khi chạm).
+MERGE_MAX_CHARS = 480  # Trần ký tự một câu gộp.
 SENTENCE_END = ".?!…"  # Đoạn trước tận cùng bằng các ký tự này coi như hết câu -> không nối.
 # --- Soát lại nhất quán sau dịch song song (1 lời gọi Gemini) ---
 # Các lô dịch song song nên xưng hô/thuật ngữ có thể trôi giữa lô dù đã có glossary chung.
@@ -454,6 +457,42 @@ def fit_score(translated: str, seconds: float, audio_seconds: float | None = Non
     return max(55, min(99, round(100 - penalty)))
 
 
+# Nháy/ngoặc hay bám sau dấu kết câu ("word." -> word.") khi xét ranh giới câu.
+_TRAILING_QUOTES = "\"”’')"
+
+
+def _sentence_piece(words: list[dict[str, Any]]) -> dict[str, Any]:
+    text = " ".join(w["text"] for w in words)
+    start = float(words[0]["start"])
+    return {"text": text, "start": start, "end": max(float(words[-1]["end"]), start)}
+
+
+def split_sentences(fragments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tách mảnh STT tại ranh giới câu theo timestamp từng từ. Whisper cắt mảnh theo cửa sổ
+    âm thanh nên mảnh ~10s thường chứa vài câu và đứt GIỮA câu; nếu giữ nguyên,
+    merge_transcripts phải nối cả mảnh (vượt trần độ dài) -> câu vẫn tách đôi, dịch rời rạc
+    và lồng tiếng ngắt quãng giữa câu. Tách nhỏ theo câu trước để bước gộp chỉ còn phải nối
+    các mẩu của cùng một câu. Mảnh không có word timestamps được giữ nguyên."""
+    pieces: list[dict[str, Any]] = []
+    for frag in fragments:
+        words = [w for w in (frag.get("words") or []) if w.get("text")]
+        if not words:
+            pieces.append({"text": frag["text"], "start": frag["start"], "end": frag["end"]})
+            continue
+        buffer: list[dict[str, Any]] = []
+        for index, word in enumerate(words):
+            buffer.append(word)
+            token = word["text"].rstrip(_TRAILING_QUOTES)
+            next_char = words[index + 1]["text"][:1] if index + 1 < len(words) else ""
+            # Chỉ tách khi từ kế không mở đầu bằng chữ thường: né viết tắt kiểu "e.g. we".
+            if token[-1:] in SENTENCE_END and not next_char.islower():
+                pieces.append(_sentence_piece(buffer))
+                buffer = []
+        if buffer:
+            pieces.append(_sentence_piece(buffer))
+    return pieces
+
+
 def merge_transcripts(
     segments: list[dict[str, Any]],
     max_gap: float = MERGE_MAX_GAP,
@@ -695,17 +734,19 @@ class Pipeline:
             raw = self._transcribe_whisper(vocals)
         else:
             raw = self._transcribe_google(vocals, job_id)
-        # Gộp đoạn vụn thành câu trọn vẹn ngay tại đây để mọi luồng gọi _transcribe (pipeline
-        # chuẩn lẫn skip-separation của CLI) đều nhận câu đầy đủ trước khi dịch/TTS.
-        return merge_transcripts(raw)
+        # Tách theo ranh giới câu (word timestamps) rồi gộp đoạn vụn thành câu trọn vẹn ngay
+        # tại đây để mọi luồng gọi _transcribe (pipeline chuẩn lẫn skip-separation của CLI)
+        # đều nhận câu đầy đủ trước khi dịch/TTS.
+        return merge_transcripts(split_sentences(raw))
 
     def _transcribe_whisper(self, vocals: Path) -> list[dict[str, Any]]:
         """STT local bằng faster-whisper (nhanh, miễn phí, không cần GCS)."""
         model = _get_whisper_model(settings.whisper_model)
-        # word_timestamps=False: chỉ dùng start/end cấp đoạn, không đọc seg.words -> tắt để
-        # bỏ hẳn pass căn chỉnh từng từ (DTW trên cross-attention), giảm thời gian STT.
+        # word_timestamps=True tốn thêm pass căn chỉnh từng từ nhưng bắt buộc: mảnh Whisper
+        # cắt theo cửa sổ âm thanh, đứt giữa câu -> cần mốc từng từ để split_sentences tách
+        # đúng ranh giới câu, tránh lồng tiếng bị ngắt quãng giữa một câu.
         segments, _info = model.transcribe(
-            str(vocals), language="en", vad_filter=True, word_timestamps=False
+            str(vocals), language="en", vad_filter=True, word_timestamps=True
         )
         output: list[dict[str, Any]] = []
         for seg in segments:
@@ -714,7 +755,12 @@ class Pipeline:
                 continue
             start = float(seg.start)
             end = max(float(seg.end), start + 0.5)
-            output.append({"text": text, "start": start, "end": end})
+            words = [
+                {"text": w.word.strip(), "start": float(w.start), "end": float(w.end)}
+                for w in (seg.words or [])
+                if (w.word or "").strip()
+            ]
+            output.append({"text": text, "start": start, "end": end, "words": words})
         if not output:
             raise PipelineError("Không phát hiện được lời thoại.")
         return output
@@ -756,7 +802,14 @@ class Pipeline:
             words = list(alt.words)
             start = _seconds(words[0].start_offset) if words else previous_end
             end = _seconds(words[-1].end_offset) if words else _seconds(result.result_end_offset)
-            output.append({"text": alt.transcript.strip(), "start": start, "end": max(end, start + 0.5)})
+            word_marks = [
+                {"text": (w.word or "").strip(), "start": _seconds(w.start_offset), "end": _seconds(w.end_offset)}
+                for w in words
+                if (w.word or "").strip()
+            ]
+            output.append(
+                {"text": alt.transcript.strip(), "start": start, "end": max(end, start + 0.5), "words": word_marks}
+            )
             previous_end = end
         if not output:
             raise PipelineError("Không phát hiện được lời thoại.")
