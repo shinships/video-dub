@@ -47,6 +47,7 @@ def init_db() -> None:
                 voice TEXT NOT NULL DEFAULT 'Aoede',
                 style TEXT NOT NULL DEFAULT 'Tự nhiên',
                 tts_engine TEXT,
+                multi_speaker INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 cancelled INTEGER NOT NULL DEFAULT 0,
                 artifacts TEXT NOT NULL DEFAULT '{}',
@@ -67,6 +68,7 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'ready',
                 audio_path TEXT,
                 audio_duration REAL,
+                speaker TEXT,
                 updated_at TEXT NOT NULL
             );
             """
@@ -83,8 +85,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
             # NULL = dùng VIDEO_DUB_TTS_ENGINE toàn cục; đặt riêng để job này dùng engine khác
             # (vd "vieneu" chạy local) mà không đổi cấu hình chung.
             "tts_engine": "TEXT",
+            # 0 = 1 giọng (như cũ); 1 = tự dò nam/nữ theo đoạn rồi gán giọng riêng.
+            "multi_speaker": "INTEGER NOT NULL DEFAULT 0",
         },
-        "segments": {"audio_duration": "REAL"},
+        "segments": {
+            "audio_duration": "REAL",
+            # 'male'/'female' do bước dò giới tính gán; NULL = chưa gán / chế độ 1 giọng.
+            "speaker": "TEXT",
+        },
     }
     for table, columns in additions.items():
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}

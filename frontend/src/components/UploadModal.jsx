@@ -1,6 +1,6 @@
 import { SpinnerGap, UploadSimple } from "@phosphor-icons/react";
 
-export function UploadModal({ busy, onUpload, onClose }) {
+export function UploadModal({ busy, multiSpeaker, onToggleMultiSpeaker, onUpload, onClose }) {
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section
@@ -21,6 +21,15 @@ export function UploadModal({ busy, onUpload, onClose }) {
           <br />
           Có thể kéo-thả video vào đây
         </p>
+        <label className="upload-option">
+          <input
+            type="checkbox"
+            checked={multiSpeaker}
+            disabled={busy}
+            onChange={(event) => onToggleMultiSpeaker(event.target.checked)}
+          />
+          Lồng tiếng 2 giọng (tự nhận nam/nữ)
+        </label>
         <label className="primary-action file-picker" htmlFor="video-file-input">
           {busy ? <SpinnerGap className="spin" /> : <UploadSimple />} Chọn video
         </label>

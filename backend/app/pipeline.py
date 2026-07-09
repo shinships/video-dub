@@ -86,6 +86,16 @@ MERGE_CONTINUATION_GAP = 1.6  # Khe lặng tối đa khi mảnh kế mở đầu
 MERGE_MAX_SECONDS = 24.0  # Trần độ dài một câu gộp (chốt an toàn, hiếm khi chạm).
 MERGE_MAX_CHARS = 480  # Trần ký tự một câu gộp.
 SENTENCE_END = ".?!…"  # Đoạn trước tận cùng bằng các ký tự này coi như hết câu -> không nối.
+# --- Dò giới tính người nói theo cao độ (F0) để lồng tiếng 2 giọng nam/nữ ---
+# Chạy local trên vocals.wav đã tách sẵn: mỗi đoạn đo trung vị F0 các khung hữu thanh, F0 dưới
+# ngưỡng -> nam, trên -> nữ. Không cần model/token mới. Chỉ chạy khi job bật multi_speaker.
+GENDER_F0_THRESHOLD = float(os.getenv("VIDEO_DUB_GENDER_F0_THRESHOLD", "165.0"))  # Hz phân nam/nữ.
+GENDER_F0_MIN = 70.0  # Sàn dải F0 hợp lệ (giọng nam trầm) — dưới mức này coi như nhiễu.
+GENDER_F0_MAX = 300.0  # Trần dải F0 hợp lệ (giọng nữ cao) — trên mức này coi như nhiễu.
+GENDER_MIN_VOICED_SEC = 0.3  # Đoạn có ít tiếng hữu thanh hơn mức này thì không đủ tin -> kế thừa.
+GENDER_FRAME_SEC = 0.04  # Khung phân tích ~40ms (đủ dài để chứa >=1 chu kỳ giọng nam trầm).
+GENDER_HOP_SEC = 0.02  # Bước nhảy khung 20ms.
+GENDER_DEFAULT = "male"  # Nhãn mặc định khi đoạn đầu chưa đủ tin để dò.
 # --- Soát lại nhất quán sau dịch song song (1 lời gọi Gemini) ---
 # Các lô dịch song song nên xưng hô/thuật ngữ có thể trôi giữa lô dù đã có glossary chung.
 REVIEW_MAX_CHARS = 24000  # Vượt trần này thì bỏ soát (phản hồi cho danh sách quá dài kém tin cậy).
@@ -248,7 +258,30 @@ def resolve_tts_engine(job: dict[str, Any]) -> str:
     return job.get("tts_engine") or settings.tts_engine
 
 
-def _synth_vieneu(text: str, output: Path) -> None:
+def resolve_segment_voice(
+    engine: str, speaker: str | None, multi_speaker: bool, cfg: Any = settings
+) -> Any:
+    """Chọn giọng cho một đoạn: trả voiceCode (str) cho Vbee, infer_kwargs (dict) cho VieNeu.
+    Multi-speaker TẮT (hoặc speaker không phải nam/nữ) -> giọng mặc định 1-giọng như cũ. BẬT:
+    female -> giọng nữ, male -> giọng nam; giọng giới tính chưa cấu hình thì fallback về mặc
+    định (giọng nam mặc định kế thừa cấu hình 1-giọng nên không phải khai lại)."""
+    if engine == "vbee":
+        default = cfg.vbee_voice
+        if not multi_speaker or speaker not in ("male", "female"):
+            return default
+        if speaker == "female":
+            return cfg.vbee_voice_female or default
+        return cfg.vbee_voice_male or default
+    # VieNeu (và mọi engine local khác dùng infer_kwargs).
+    default_kwargs = vieneu_infer_kwargs(cfg.vieneu_voice, cfg.vieneu_ref_audio)
+    if not multi_speaker or speaker not in ("male", "female"):
+        return default_kwargs
+    if speaker == "female":
+        return vieneu_infer_kwargs(cfg.vieneu_voice_female, cfg.vieneu_ref_audio_female) or default_kwargs
+    return vieneu_infer_kwargs(cfg.vieneu_voice_male, cfg.vieneu_ref_audio_male) or default_kwargs
+
+
+def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None = None) -> None:
     """TTS local bằng VieNeu (không gọi cloud). Giữ lock xuyên suốt nạp + suy luận:
     model giữ trạng thái nội bộ nên không an toàn khi gọi song song, và suy luận vốn
     nghẽn CPU — chạy tuần tự không làm chậm thêm so với chạy chồng lên nhau."""
@@ -258,8 +291,9 @@ def _synth_vieneu(text: str, output: Path) -> None:
             from vieneu import Vieneu
 
             _vieneu_model = Vieneu(device=settings.vieneu_device)
-        kwargs = vieneu_infer_kwargs(settings.vieneu_voice, settings.vieneu_ref_audio)
-        audio = _vieneu_model.infer(text, **kwargs)
+        if infer_kwargs is None:
+            infer_kwargs = vieneu_infer_kwargs(settings.vieneu_voice, settings.vieneu_ref_audio)
+        audio = _vieneu_model.infer(text, **infer_kwargs)
         _vieneu_model.save(audio, str(output))
 
 
@@ -317,7 +351,7 @@ def _vbee_json(resp: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _synth_vbee(text: str, output: Path) -> None:
+def _synth_vbee(text: str, output: Path, voice: str | None = None) -> None:
     """TTS tiếng Việt qua Vbee: POST tạo yêu cầu -> poll tới COMPLETED -> tải audioLink.
     Mỗi đoạn độc lập nên gọi song song thoải mái (khác VieNeu phải giữ lock)."""
     import httpx
@@ -327,7 +361,7 @@ def _synth_vbee(text: str, output: Path) -> None:
             "Thiếu App ID/token Vbee (đặt VIDEO_DUB_VBEE_APP_ID và VIDEO_DUB_VBEE_TOKEN)."
         )
     headers = vbee_headers()
-    payload = vbee_request_payload(text, settings.vbee_voice)
+    payload = vbee_request_payload(text, voice or settings.vbee_voice)
     # follow_redirects: audioLink (vbee.vn/s/…) chuyển hướng sang S3 mới ra file thật.
     with httpx.Client(timeout=VBEE_HTTP_TIMEOUT, follow_redirects=True) as client:
         info = vbee_read(_vbee_json(client.post(VBEE_API_URL, headers=headers, json=payload)))
@@ -534,6 +568,79 @@ def merge_transcripts(
     return merged
 
 
+def classify_gender(median_f0: float, threshold: float = GENDER_F0_THRESHOLD) -> str:
+    """Phân giới tính người nói theo trung vị F0: dưới ngưỡng -> nam, bằng/trên -> nữ."""
+    return "male" if median_f0 < threshold else "female"
+
+
+def assign_speakers(
+    f0_values: list[float | None],
+    threshold: float = GENDER_F0_THRESHOLD,
+    default: str = GENDER_DEFAULT,
+) -> list[str]:
+    """Gán nhãn 'male'/'female' cho từng đoạn từ danh sách trung vị F0. Đoạn None (không đủ
+    tiếng hữu thanh để tin) KẾ THỪA nhãn đoạn liền trước cho mượt (im lặng/ậm ừ giữa lượt nói
+    không nên đảo giọng); đoạn đầu mà None thì dùng nhãn mặc định."""
+    labels: list[str] = []
+    previous = default
+    for value in f0_values:
+        label = classify_gender(value, threshold) if value is not None else previous
+        labels.append(label)
+        previous = label
+    return labels
+
+
+def segment_median_f0(
+    samples: Any,
+    sr: int,
+    start: float,
+    end: float,
+    f0_min: float = GENDER_F0_MIN,
+    f0_max: float = GENDER_F0_MAX,
+    min_voiced_sec: float = GENDER_MIN_VOICED_SEC,
+) -> float | None:
+    """Đo trung vị F0 các khung hữu thanh trong lát [start,end] của tín hiệu mono bằng tự
+    tương quan (numpy). Trả None nếu tổng thời lượng khung hữu thanh < min_voiced_sec (không
+    đủ tin). Chỉ nhận F0 rơi trong dải [f0_min,f0_max] để loại nhiễu/nhạc nền còn sót."""
+    import numpy as np
+
+    a = int(max(0.0, start) * sr)
+    b = int(max(start, end) * sr)
+    clip = np.asarray(samples[a:b], dtype=np.float64)
+    if clip.size < int(GENDER_FRAME_SEC * sr):
+        return None
+    frame = int(GENDER_FRAME_SEC * sr)
+    hop = max(1, int(GENDER_HOP_SEC * sr))
+    lag_min = max(1, int(sr / f0_max))
+    lag_max = min(frame - 1, int(sr / f0_min))
+    if lag_max <= lag_min:
+        return None
+    # Ngưỡng năng lượng khung hữu thanh: theo RMS toàn lát (bỏ khung lặng/nhiễu nhỏ).
+    rms_all = float(np.sqrt(np.mean(clip**2))) if clip.size else 0.0
+    energy_floor = max(1e-4, rms_all * 0.5)
+    pitches: list[float] = []
+    for offset in range(0, clip.size - frame + 1, hop):
+        window = clip[offset : offset + frame]
+        rms = float(np.sqrt(np.mean(window**2)))
+        if rms < energy_floor:
+            continue
+        window = window - window.mean()
+        corr = np.correlate(window, window, mode="full")[frame - 1 :]
+        if corr[0] <= 0:
+            continue
+        segment = corr[lag_min : lag_max + 1]
+        if segment.size == 0:
+            continue
+        peak = int(np.argmax(segment)) + lag_min
+        # Đỉnh tự tương quan phải đủ rõ so với năng lượng khung (corr[0]) mới coi là hữu thanh.
+        if corr[peak] < 0.3 * corr[0]:
+            continue
+        pitches.append(sr / peak)
+    if len(pitches) * hop / sr < min_voiced_sec:
+        return None
+    return float(np.median(pitches))
+
+
 async def _stage(job_id: str, hook: EventHook, stage: str, progress: int, message: str) -> None:
     job = get_job(job_id, include_segments=False)
     if not job or job["cancelled"]:
@@ -658,12 +765,18 @@ class Pipeline:
         background, vocals = self._separate(audio, work)
         artifacts = {"source_audio": str(audio), "background": str(background), "vocals": str(vocals)}
         update_job(job_id, artifacts=artifacts, stage="transcribe", progress=35)
+        speech_path = vocals
         try:
             transcripts = self._transcribe(vocals, job_id)
         except PipelineError as exc:
             if "Không phát hiện" not in str(exc):
                 raise
+            speech_path = audio
             transcripts = self._transcribe(audio, job_id)
+        # Lồng tiếng 2 giọng: dò giới tính từng đoạn trên đúng file đã sinh transcript, gán
+        # 'speaker' để _translate spread giữ lại và _replace_segments lưu vào DB.
+        if job.get("multi_speaker"):
+            transcripts = self._detect_speakers(speech_path, transcripts)
         translated, context = self._translate(transcripts, job.get("style", "tự nhiên"))
         if context:
             # Lưu hướng dẫn dịch để bước viết-lại lúc export giữ đúng glossary/xưng hô.
@@ -673,6 +786,7 @@ class Pipeline:
             [(item["text"], item["translated"]) for item in translated],
             default_length=4.8,
             timings=[(item["start"], item["end"]) for item in translated],
+            speakers=[item.get("speaker") for item in translated],
         )
 
     def _separate(self, audio: Path, work: Path) -> tuple[Path, Path]:
@@ -738,6 +852,29 @@ class Pipeline:
         # tại đây để mọi luồng gọi _transcribe (pipeline chuẩn lẫn skip-separation của CLI)
         # đều nhận câu đầy đủ trước khi dịch/TTS.
         return merge_transcripts(split_sentences(raw))
+
+    def _detect_speakers(
+        self, speech_path: Path, transcripts: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Gán nhãn 'male'/'female' cho từng transcript theo trung vị F0 của đúng lát audio
+        (đọc file speech MỘT lần). Dùng cho lồng tiếng 2 giọng. Lỗi dò giọng KHÔNG được làm
+        hỏng job -> nuốt exception, để nguyên (không speaker) và tiếp tục 1 giọng."""
+        if not transcripts:
+            return transcripts
+        try:
+            import soundfile as sf
+
+            samples, sr = sf.read(str(speech_path), dtype="float32", always_2d=False)
+            if getattr(samples, "ndim", 1) > 1:  # stereo -> trộn về mono cho phân tích F0.
+                samples = samples.mean(axis=1)
+            f0_values = [
+                segment_median_f0(samples, sr, item["start"], item["end"]) for item in transcripts
+            ]
+            for item, label in zip(transcripts, assign_speakers(f0_values)):
+                item["speaker"] = label
+        except Exception as exc:  # noqa: BLE001 - dò giọng chỉ là tăng cường, không chặn job.
+            print(f"[multi-speaker] bỏ qua dò giới tính ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return transcripts
 
     def _transcribe_whisper(self, vocals: Path) -> list[dict[str, Any]]:
         """STT local bằng faster-whisper (nhanh, miễn phí, không cần GCS)."""
@@ -1015,19 +1152,21 @@ class Pipeline:
         rows: list[tuple[str, str]],
         default_length: float,
         timings: list[tuple[float, float]] | None = None,
+        speakers: list[str | None] | None = None,
     ) -> None:
         with connect() as conn:
             conn.execute("DELETE FROM segments WHERE job_id = ?", (job_id,))
             cursor = 0.0
             for index, (source, translated) in enumerate(rows, 1):
                 start, end = timings[index - 1] if timings else (cursor, cursor + default_length)
+                speaker = speakers[index - 1] if speakers else None
                 score = fit_score(translated, end - start)
                 conn.execute(
                     """
                     INSERT INTO segments
                     (id, job_id, position, start, end, source_text, translated_text,
-                     fit_score, status, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)
+                     fit_score, status, speaker, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
                     """,
                     (
                         str(uuid.uuid4()),
@@ -1038,6 +1177,7 @@ class Pipeline:
                         source,
                         translated,
                         score,
+                        speaker,
                         now_iso(),
                     ),
                 )
@@ -1101,6 +1241,8 @@ class Pipeline:
         output = settings.jobs_dir / job_id / f"segment-{segment['position']:04d}{suffix}"
         seconds = max(0.5, segment["end"] - segment["start"])
         text = segment["translated_text"]
+        # Lồng tiếng 2 giọng: chọn giọng theo nhãn nam/nữ đã dò; multi tắt -> giọng mặc định.
+        voice = resolve_segment_voice(engine, segment.get("speaker"), bool(job.get("multi_speaker")))
 
         # Vòng khớp độ dài: nếu TTS dài hơn khung quá ngưỡng thì viết lại ngắn hơn rồi synth lại.
         # Đo thật + viết lại + atempo lúc render vẫn khống chế được độ dài cho cả hai engine.
@@ -1108,9 +1250,9 @@ class Pipeline:
         duration = 0.0
         for attempt in range(FIT_MAX_RETRIES + 1):
             if engine == "vieneu":
-                _synth_vieneu(text, output)
+                _synth_vieneu(text, output, voice)
             elif engine == "vbee":
-                _synth_vbee(text, output)
+                _synth_vbee(text, output, voice)
             else:
                 raise PipelineError(
                     f"Engine TTS không hỗ trợ: {engine!r}. Chỉ dùng 'vieneu' hoặc 'vbee'."

@@ -14,8 +14,12 @@ from app.pipeline import (
     _strip_json,
     fit_score,
     merge_transcripts,
+    assign_speakers,
+    classify_gender,
+    resolve_segment_voice,
     resolve_tts_engine,
     segment_audio_suffix,
+    segment_median_f0,
     segment_tempo,
     split_sentences,
     vbee_read,
@@ -275,6 +279,93 @@ def test_merge_transcripts_skips_empty_segments():
         ]
     )
     assert [m["text"] for m in merged] == ["hi"]
+
+
+def test_classify_gender_threshold():
+    # F0 thấp -> nam, cao -> nữ; đúng biên 165Hz (bằng ngưỡng tính là nữ).
+    assert classify_gender(120.0) == "male"
+    assert classify_gender(210.0) == "female"
+    assert classify_gender(165.0) == "female"
+    assert classify_gender(164.9) == "male"
+
+
+def test_assign_speakers_smoothing():
+    # None kế thừa nhãn đoạn trước; đoạn đầu None -> mặc định "male".
+    assert assign_speakers([120.0, None, 210.0, None]) == ["male", "male", "female", "female"]
+    assert assign_speakers([None, 210.0]) == ["male", "female"]
+    # Toàn bộ nữ và xen kẽ nam/nữ.
+    assert assign_speakers([200.0, 220.0]) == ["female", "female"]
+    assert assign_speakers([120.0, 210.0, 130.0]) == ["male", "female", "male"]
+
+
+def test_assign_speakers_empty():
+    assert assign_speakers([]) == []
+
+
+def _voice_cfg():
+    # Cfg giả lập giống Settings cho resolve_segment_voice (dataclass thật là frozen).
+    return SimpleNamespace(
+        vbee_voice="v_default",
+        vbee_voice_male="v_male",
+        vbee_voice_female="v_female",
+        vieneu_voice="vn_default",
+        vieneu_ref_audio="",
+        vieneu_voice_male="vn_male",
+        vieneu_ref_audio_male="",
+        vieneu_voice_female="vn_female",
+        vieneu_ref_audio_female="",
+    )
+
+
+def test_resolve_segment_voice_vbee_by_gender():
+    cfg = _voice_cfg()
+    assert resolve_segment_voice("vbee", "female", True, cfg) == "v_female"
+    assert resolve_segment_voice("vbee", "male", True, cfg) == "v_male"
+    # Multi tắt -> giọng mặc định 1-giọng như cũ, bất kể nhãn.
+    assert resolve_segment_voice("vbee", "female", False, cfg) == "v_default"
+    assert resolve_segment_voice("vbee", None, True, cfg) == "v_default"
+
+
+def test_resolve_segment_voice_vieneu_by_gender():
+    cfg = _voice_cfg()
+    assert resolve_segment_voice("vieneu", "female", True, cfg) == {"voice": "vn_female"}
+    assert resolve_segment_voice("vieneu", "male", True, cfg) == {"voice": "vn_male"}
+    # Multi tắt -> infer_kwargs mặc định (giữ hành vi cũ).
+    assert resolve_segment_voice("vieneu", "female", False, cfg) == {"voice": "vn_default"}
+
+
+def test_resolve_segment_voice_falls_back_when_gender_unset():
+    # Giọng nữ chưa cấu hình -> fallback về mặc định thay vì trả rỗng/hỏng.
+    cfg = _voice_cfg()
+    cfg.vbee_voice_female = ""
+    cfg.vieneu_voice_female = ""
+    cfg.vieneu_ref_audio_female = ""
+    assert resolve_segment_voice("vbee", "female", True, cfg) == "v_default"
+    assert resolve_segment_voice("vieneu", "female", True, cfg) == {"voice": "vn_default"}
+
+
+def test_segment_median_f0_on_synthetic_tone():
+    # Sóng sin 120Hz -> trung vị F0 rơi quanh 120 (biên nam), 220Hz -> quanh 220 (biên nữ).
+    import numpy as np
+
+    sr = 16000
+    t = np.arange(sr * 2) / sr  # 2 giây đủ nhiều khung hữu thanh.
+    male = 0.5 * np.sin(2 * np.pi * 120.0 * t)
+    female = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    f0_male = segment_median_f0(male, sr, 0.0, 2.0)
+    f0_female = segment_median_f0(female, sr, 0.0, 2.0)
+    assert f0_male is not None and abs(f0_male - 120.0) < 8.0
+    assert f0_female is not None and abs(f0_female - 220.0) < 12.0
+    assert classify_gender(f0_male) == "male"
+    assert classify_gender(f0_female) == "female"
+
+
+def test_segment_median_f0_returns_none_on_silence():
+    import numpy as np
+
+    sr = 16000
+    silence = np.zeros(sr)  # 1 giây im lặng -> không đủ khung hữu thanh.
+    assert segment_median_f0(silence, sr, 0.0, 1.0) is None
 
 
 def test_translate_applies_review_fixes(monkeypatch):

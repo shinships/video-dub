@@ -56,11 +56,16 @@ cd backend; ..\.venv\Scripts\python -m pytest -q
    có khống chế độ dài (giây/ký tự) để khớp lồng tiếng; cuối cùng `_review_translations`
    **soát lại nhất quán 1 lời gọi** (dọn lệch xưng hô/glossary giữa các lô song song).
 
+   Nếu job bật `multi_speaker`: trước khi dịch, `_detect_speakers` dò giới tính từng đoạn theo
+   cao độ (F0) trên đúng file audio đã sinh transcript (`segment_median_f0` + `assign_speakers`,
+   ngưỡng `GENDER_F0_THRESHOLD`), gán `speaker` ('male'/'female') để lưu vào cột `segments.speaker`.
+
 `Pipeline.export`:
 5. TTS song song (`asyncio.gather` + `Semaphore(TTS_WORKERS)`) qua `_synthesize_segment`,
    có **vòng khớp độ dài**: đo TTS thật, nếu dài quá `FIT_TOLERANCE` thì `_rewrite_shorter`
    rồi synth lại (≤ `FIT_MAX_RETRIES`). Trước khi đo, `_trim_silence` cắt lặng đầu/đuôi audio
-   TTS (đo chính xác, bớt vào câu trễ).
+   TTS (đo chính xác, bớt vào câu trễ). Giọng mỗi đoạn do `resolve_segment_voice` chọn theo
+   `speaker` khi bật `multi_speaker` (nam/nữ), ngược lại dùng giọng mặc định 1-giọng như cũ.
 6. `_render` (FFmpeg): mỗi đoạn `atempo` theo `segment_tempo` (không kéo chậm câu ngắn;
    câu dài tràn sang khoảng lặng trước khi tăng tốc, kẹp `ATEMPO_MAX`) + `adelay`; bus thoại
    chuẩn `-16 LUFS`; **giữ nền gốc bằng ducking động** (`sidechaincompress`); mix cuối qua
@@ -72,7 +77,7 @@ cd backend; ..\.venv\Scripts\python -m pytest -q
 - **Import nặng đặt trong hàm** (`google.*`, `faster_whisper`, `texttospeech`…) để app chạy
   được ở demo mode và test không cần cài cloud/audio deps.
 - Tham số mix/dịch/khớp là **hằng số module đầu file** `pipeline.py` (`NARRATION_LUFS`,
-  `DUCK_*`, `ATEMPO_*`, `TRANSLATE_*`, `FIT_*`, `TTS_WORKERS`). Sửa hành vi qua hằng số này.
+  `DUCK_*`, `ATEMPO_*`, `TRANSLATE_*`, `FIT_*`, `TTS_WORKERS`, `GENDER_*`). Sửa hành vi qua hằng số này.
 - Thêm cột DB: cập nhật `CREATE TABLE` **và** `_migrate` trong [db.py](backend/app/db.py).
 - `effective_demo_mode = True` khi thiếu FFmpeg hoặc cloud config → pipeline chạy giả lập
   (`DEMO_SEGMENTS`), không gọi cloud. Job `demo` được seed lúc khởi động.

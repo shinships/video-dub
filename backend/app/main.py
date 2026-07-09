@@ -76,6 +76,8 @@ class JobSettingsPatch(BaseModel):
     # Đặt riêng engine cho job này, khác VIDEO_DUB_TTS_ENGINE toàn cục (vd job A dùng "vieneu"
     # local trong khi job B dùng "vbee" cloud). Gemini TTS đã bị loại bỏ.
     tts_engine: Literal["vieneu", "vbee"] | None = None
+    # Bật/tắt lồng tiếng 2 giọng (tự dò nam/nữ) cho riêng job này trước khi chạy.
+    multi_speaker: bool | None = None
 
 
 @app.get("/api/health")
@@ -93,10 +95,14 @@ def health() -> dict[str, Any]:
 
 @app.get("/api/voices")
 def voices() -> dict[str, Any]:
-    """Danh sách engine TTS (tĩnh, không gọi cloud). Chỉ VieNeu và Vbee; Gemini TTS đã bỏ."""
+    """Danh sách engine TTS (tĩnh, không gọi cloud). Chỉ VieNeu và Vbee; Gemini TTS đã bỏ.
+    Kèm giọng nam/nữ dùng khi bật lồng tiếng 2 giọng (multi_speaker)."""
     vieneu_voice = settings.vieneu_voice or "default"
+    vieneu_male = settings.vieneu_voice_male or settings.vieneu_ref_audio_male or vieneu_voice
+    vieneu_female = settings.vieneu_voice_female or settings.vieneu_ref_audio_female or "(chưa đặt)"
     return {
         "default_engine": settings.tts_engine,
+        "multi_speaker_default": settings.multi_speaker,
         "engines": [
             {
                 "id": "vieneu",
@@ -108,6 +114,7 @@ def voices() -> dict[str, Any]:
                         "desc": "Đặt qua VIDEO_DUB_VIENEU_VOICE",
                     }
                 ],
+                "gendered_voices": {"male": vieneu_male, "female": vieneu_female},
             },
             {
                 "id": "vbee",
@@ -119,6 +126,10 @@ def voices() -> dict[str, Any]:
                         "desc": "Đặt qua VIDEO_DUB_VBEE_VOICE",
                     }
                 ],
+                "gendered_voices": {
+                    "male": settings.vbee_voice_male or settings.vbee_voice,
+                    "female": settings.vbee_voice_female or settings.vbee_voice,
+                },
             },
         ],
     }
@@ -142,6 +153,8 @@ async def create_job(
     file: UploadFile = File(...),
     voice: str = Form("Aoede"),
     style: str = Form("Tự nhiên"),
+    # Bật lồng tiếng 2 giọng (tự dò nam/nữ). Không gửi -> theo mặc định env VIDEO_DUB_MULTI_SPEAKER.
+    multi_speaker: bool = Form(settings.multi_speaker),
 ) -> dict[str, Any]:
     extension = Path(file.filename or "").suffix.lower()
     if extension not in {".mp4", ".mkv", ".mov"}:
@@ -162,7 +175,7 @@ async def create_job(
             destination.unlink(missing_ok=True)
             raise HTTPException(422, f"Video không hợp lệ: {exc}") from exc
     job = service.register_job(
-        job_id, file.filename or destination.name, destination, metadata, voice, style
+        job_id, file.filename or destination.name, destination, metadata, voice, style, multi_speaker
     )
     await work_queue.put(job_id)
     return job

@@ -58,6 +58,7 @@ export function App() {
   const [busy, setBusy] = useState("");
   const [toast, setToast] = useState(null);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [multiSpeaker, setMultiSpeaker] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
 
   const seekRef = useRef(null);
@@ -272,6 +273,7 @@ export function App() {
       data.append("file", file);
       data.append("voice", job.voice);
       data.append("style", job.style);
+      data.append("multi_speaker", multiSpeaker ? "true" : "false");
       try {
         const created = await api("/jobs", { method: "POST", body: data });
         applyJob(created);
@@ -283,7 +285,7 @@ export function App() {
         setBusy("");
       }
     },
-    [job.voice, job.style, applyJob, showToast],
+    [job.voice, job.style, multiSpeaker, applyJob, showToast],
   );
 
   const exportVideo = useCallback(async () => {
@@ -431,7 +433,15 @@ export function App() {
 
       <Toast toast={toast} />
 
-      {uploadOpen && <UploadModal busy={busy === "upload"} onUpload={upload} onClose={() => setUploadOpen(false)} />}
+      {uploadOpen && (
+        <UploadModal
+          busy={busy === "upload"}
+          multiSpeaker={multiSpeaker}
+          onToggleMultiSpeaker={setMultiSpeaker}
+          onUpload={upload}
+          onClose={() => setUploadOpen(false)}
+        />
+      )}
     </main>
   );
 }

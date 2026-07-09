@@ -74,6 +74,18 @@ class Settings:
     vieneu_voice: str = os.getenv("VIDEO_DUB_VIENEU_VOICE", "")
     # File wav 3-5 giây để nhân bản giọng; nếu đặt sẽ ưu tiên hơn vieneu_voice.
     vieneu_ref_audio: str = os.getenv("VIDEO_DUB_VIENEU_REF_AUDIO", "")
+    # --- Lồng tiếng 2 giọng (nam/nữ) ---
+    # Bật tự dò giới tính người nói theo đoạn rồi gán giọng riêng. Mặc định tắt (giữ 1 giọng
+    # như cũ); có thể bật riêng từng job qua cờ CLI --multi-speaker hoặc Form khi upload.
+    multi_speaker: bool = os.getenv("VIDEO_DUB_MULTI_SPEAKER", "false").lower() in {"1", "true", "yes"}
+    # Giọng theo giới tính khi bật multi_speaker. Giọng NAM mặc định kế thừa cấu hình 1-giọng
+    # hiện có (vbee_voice/vieneu_voice/ref_audio) để không phải khai lại; chỉ cần thêm giọng NỮ.
+    vbee_voice_male: str = os.getenv("VIDEO_DUB_VBEE_VOICE_MALE", "")
+    vbee_voice_female: str = os.getenv("VIDEO_DUB_VBEE_VOICE_FEMALE", "hn_female_ngochuyen_full_48k-fhg")
+    vieneu_voice_male: str = os.getenv("VIDEO_DUB_VIENEU_VOICE_MALE", "")
+    vieneu_ref_audio_male: str = os.getenv("VIDEO_DUB_VIENEU_REF_AUDIO_MALE", "")
+    vieneu_voice_female: str = os.getenv("VIDEO_DUB_VIENEU_VOICE_FEMALE", "")
+    vieneu_ref_audio_female: str = os.getenv("VIDEO_DUB_VIENEU_REF_AUDIO_FEMALE", "")
     # Mặc định "cpu" (đường ONNX torch-free, đã kiểm chứng ổn định): VieNeu tự dò thấy
     # CUDA của torch (cài cho Demucs) và cố chạy GPU sẽ đụng cuDNN thiếu symbol trên máy
     # đã test. Chỉ đổi "cuda" nếu đã xác nhận cuDNN tương thích với torch của dự án.

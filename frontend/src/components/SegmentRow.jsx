@@ -43,7 +43,14 @@ export const SegmentRow = memo(function SegmentRow({
         {clock(segment.start)}
         <br />– {clock(segment.end)}
       </button>
-      <p className="source-copy">{segment.source_text}</p>
+      <p className="source-copy">
+        {segment.speaker && (
+          <span className={`speaker-badge ${segment.speaker}`}>
+            {segment.speaker === "female" ? "Nữ" : "Nam"}
+          </span>
+        )}
+        {segment.source_text}
+      </p>
       <div className="translation-box">
         <textarea
           value={draft}

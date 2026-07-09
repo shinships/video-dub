@@ -70,6 +70,7 @@ def register_job(
     metadata: dict[str, Any],
     voice: str,
     style: str,
+    multi_speaker: bool = False,
 ) -> dict[str, Any]:
     """Ghi một job 'queued' vào DB. Dùng chung cho web upload và CLI."""
     now = now_iso()
@@ -78,8 +79,8 @@ def register_job(
             """
             INSERT INTO jobs
             (id, name, source_path, status, stage, progress, duration, width, height,
-             voice, style, speed, artifacts, cost, created_at, updated_at)
-            VALUES (?, ?, ?, 'queued', 'upload', 3, ?, ?, ?, ?, ?, ?, '{}', '{}', ?, ?)
+             voice, style, speed, multi_speaker, artifacts, cost, created_at, updated_at)
+            VALUES (?, ?, ?, 'queued', 'upload', 3, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', ?, ?)
             """,
             (
                 job_id,
@@ -91,6 +92,7 @@ def register_job(
                 voice,
                 style,
                 DEFAULT_JOB_SPEED,
+                1 if multi_speaker else 0,
                 now,
                 now,
             ),

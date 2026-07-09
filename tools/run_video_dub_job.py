@@ -44,6 +44,13 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("VIDEO_DUB_JOB_TTS_ENGINE"),
         help="Ghi đè engine TTS riêng cho job này (mặc định: dùng VIDEO_DUB_TTS_ENGINE toàn cục).",
     )
+    parser.add_argument(
+        "--multi-speaker",
+        dest="multi_speaker",
+        action="store_true",
+        default=os.getenv("VIDEO_DUB_MULTI_SPEAKER", "false").lower() in {"1", "true", "yes"},
+        help="Lồng tiếng 2 giọng: tự dò nam/nữ theo đoạn rồi gán giọng riêng.",
+    )
     parser.add_argument("--speed", type=float, default=None, help="Toc do video output, vi du 1.1.")
     parser.add_argument("--style", default=os.getenv("VIDEO_DUB_STYLE", "Tự nhiên"))
     parser.add_argument("--output", default=os.getenv("VIDEO_DUB_OUTPUT"), help="Nơi lưu MP4 kết quả.")
@@ -262,6 +269,8 @@ async def main() -> None:
         update_job(job_id, speed=args.speed)
     if args.tts_engine:
         update_job(job_id, tts_engine=args.tts_engine)
+    # Ghi rõ 0/1 theo cờ + env để cả nhánh --allow-long lẫn thường đều tôn trọng cấu hình.
+    update_job(job_id, multi_speaker=1 if args.multi_speaker else 0)
     # Lưu lại đường dẫn/URL nguồn gốc (job["source_path"] chỉ là bản copy nội bộ trong
     # data/uploads) để --resume sau này (không truyền lại --source) vẫn xuất đúng vị trí
     # cạnh file gốc thay vì rơi về thư mục hiện tại.
