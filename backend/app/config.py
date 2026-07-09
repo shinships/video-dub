@@ -59,12 +59,12 @@ class Settings:
     google_project: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
     google_region: str = os.getenv("GOOGLE_CLOUD_REGION", "global")
     gcs_bucket: str = os.getenv("VIDEO_DUB_GCS_BUCKET", "")
+    # Model Gemini cho bước DỊCH (Vertex AI) — vẫn dùng dù TTS đã bỏ Gemini.
     gemini_model: str = os.getenv("VIDEO_DUB_GEMINI_MODEL", "gemini-2.5-flash")
-    tts_model: str = os.getenv("VIDEO_DUB_TTS_MODEL", "gemini-2.5-flash-tts")
-    # Engine tạo giọng: "gemini" (cloud Vertex AI, mặc định) | "vieneu" (local, miễn phí,
-    # cần cài requirements-tts-local.txt; bước TTS không gọi cloud nữa) | "vbee" (cloud VN,
-    # giọng tiếng Việt tự nhiên, gọi HTTP bất đồng bộ; cần App ID + token studio Vbee).
-    tts_engine: str = os.getenv("VIDEO_DUB_TTS_ENGINE", "gemini").lower()
+    # Engine tạo giọng: "vieneu" (local, miễn phí, mặc định; cần requirements-tts-local.txt,
+    # bước TTS không gọi cloud) | "vbee" (cloud VN, giọng tiếng Việt tự nhiên, gọi HTTP bất
+    # đồng bộ; cần App ID + token studio Vbee). Gemini TTS đã bị loại bỏ.
+    tts_engine: str = os.getenv("VIDEO_DUB_TTS_ENGINE", "vieneu").lower()
     # Vbee TTS — App ID và token lấy trong studio Vbee (không hard-code, đọc từ env).
     vbee_app_id: str = os.getenv("VIDEO_DUB_VBEE_APP_ID", "")
     vbee_token: str = os.getenv("VIDEO_DUB_VBEE_TOKEN", "")

@@ -73,9 +73,9 @@ class JobSettingsPatch(BaseModel):
     style: str | None = None
     speed: float | None = Field(default=None, ge=0.5, le=2.0)
     pitch: float | None = Field(default=None, ge=-6, le=6)
-    # Không có trên UI — đặt riêng cho job này để dùng engine khác VIDEO_DUB_TTS_ENGINE
-    # toàn cục (vd chạy "vieneu" cho job A trong khi job B vẫn dùng "gemini").
-    tts_engine: Literal["gemini", "vieneu", "vbee"] | None = None
+    # Đặt riêng engine cho job này, khác VIDEO_DUB_TTS_ENGINE toàn cục (vd job A dùng "vieneu"
+    # local trong khi job B dùng "vbee" cloud). Gemini TTS đã bị loại bỏ.
+    tts_engine: Literal["vieneu", "vbee"] | None = None
 
 
 @app.get("/api/health")
@@ -88,6 +88,39 @@ def health() -> dict[str, Any]:
         "cloud_ready": settings.cloud_ready,
         "tts_engine": settings.tts_engine,
         "gpu": detect_gpu(),
+    }
+
+
+@app.get("/api/voices")
+def voices() -> dict[str, Any]:
+    """Danh sách engine TTS (tĩnh, không gọi cloud). Chỉ VieNeu và Vbee; Gemini TTS đã bỏ."""
+    vieneu_voice = settings.vieneu_voice or "default"
+    return {
+        "default_engine": settings.tts_engine,
+        "engines": [
+            {
+                "id": "vieneu",
+                "label": "VieNeu (chạy local)",
+                "voices": [
+                    {
+                        "id": vieneu_voice,
+                        "label": f"Giọng {vieneu_voice}",
+                        "desc": "Đặt qua VIDEO_DUB_VIENEU_VOICE",
+                    }
+                ],
+            },
+            {
+                "id": "vbee",
+                "label": "Vbee (cloud)",
+                "voices": [
+                    {
+                        "id": settings.vbee_voice,
+                        "label": settings.vbee_voice,
+                        "desc": "Đặt qua VIDEO_DUB_VBEE_VOICE",
+                    }
+                ],
+            },
+        ],
     }
 
 
@@ -217,11 +250,43 @@ async def events(job_id: str) -> StreamingResponse:
 
 
 @app.get("/api/jobs/{job_id}/download")
-def download(job_id: str) -> FileResponse:
+def download(job_id: str, kind: Literal["video", "srt"] = "video") -> FileResponse:
     current = get_job(job_id, include_segments=False)
-    path = Path((current or {}).get("artifacts", {}).get("video", ""))
+    if not current:
+        raise HTTPException(404, "Không tìm thấy dự án.")
+    if kind == "srt":
+        # SRT do _write_srt ghi cạnh output, không lưu trong artifacts.
+        path = settings.jobs_dir / job_id / "subtitles-vi.srt"
+    else:
+        path = Path(current.get("artifacts", {}).get("video", ""))
     if not path.is_file():
         raise HTTPException(404, "File xuất chưa sẵn sàng.")
+    return FileResponse(path, filename=path.name)
+
+
+@app.get("/api/jobs/{job_id}/source")
+def source_media(job_id: str) -> FileResponse:
+    """Serve video gốc cho player (FileResponse hỗ trợ Range nên tua được)."""
+    current = get_job(job_id, include_segments=False)
+    if not current:
+        raise HTTPException(404, "Không tìm thấy dự án.")
+    path = Path(current.get("source_path") or "")
+    if not path.is_file():
+        raise HTTPException(404, "Video gốc không còn trên đĩa.")
+    return FileResponse(path, filename=path.name)
+
+
+@app.get("/api/jobs/{job_id}/segments/{segment_id}/audio")
+def segment_audio(job_id: str, segment_id: str) -> FileResponse:
+    current = get_job(job_id)
+    segment = next(
+        (item for item in (current or {}).get("segments", []) if item["id"] == segment_id), None
+    )
+    if not segment:
+        raise HTTPException(404, "Không tìm thấy phân đoạn.")
+    path = Path(segment.get("audio_path") or "")
+    if not path.is_file():
+        raise HTTPException(404, "Chưa có audio cho câu này.")
     return FileResponse(path, filename=path.name)
 
 

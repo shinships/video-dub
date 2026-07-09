@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", default=os.getenv("VIDEO_DUB_SOURCE"), help="File local hoặc URL.")
     parser.add_argument("--job-id", default=os.getenv("VIDEO_DUB_JOB_ID") or str(uuid.uuid4()))
     parser.add_argument("--voice", default=os.getenv("VIDEO_DUB_VOICE", "Aoede"))
+    parser.add_argument(
+        "--tts-engine",
+        choices=["vieneu", "vbee"],
+        default=os.getenv("VIDEO_DUB_JOB_TTS_ENGINE"),
+        help="Ghi đè engine TTS riêng cho job này (mặc định: dùng VIDEO_DUB_TTS_ENGINE toàn cục).",
+    )
     parser.add_argument("--speed", type=float, default=None, help="Toc do video output, vi du 1.1.")
     parser.add_argument("--style", default=os.getenv("VIDEO_DUB_STYLE", "Tự nhiên"))
     parser.add_argument("--output", default=os.getenv("VIDEO_DUB_OUTPUT"), help="Nơi lưu MP4 kết quả.")
@@ -226,6 +232,8 @@ async def main() -> None:
             update_job(job["id"], status="review", stage="translate", error=None)
         if args.speed is not None:
             update_job(job["id"], speed=args.speed)
+        if args.tts_engine:
+            update_job(job["id"], tts_engine=args.tts_engine)
         if args.review_in:
             apply_review_file(job["id"], args.review_in)
         await finalize(job["id"])
@@ -252,6 +260,8 @@ async def main() -> None:
     _current_job_id = job_id
     if args.speed is not None:
         update_job(job_id, speed=args.speed)
+    if args.tts_engine:
+        update_job(job_id, tts_engine=args.tts_engine)
     # Lưu lại đường dẫn/URL nguồn gốc (job["source_path"] chỉ là bản copy nội bộ trong
     # data/uploads) để --resume sau này (không truyền lại --source) vẫn xuất đúng vị trí
     # cạnh file gốc thay vì rơi về thư mục hiện tại.

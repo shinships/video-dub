@@ -1,5 +1,4 @@
 import json
-import time
 from types import SimpleNamespace
 
 import app.pipeline as pipeline_module
@@ -12,7 +11,6 @@ from app.pipeline import (
     _is_rate_limited,
     _parse_translations,
     _pitch_chain,
-    _RateLimiter,
     _strip_json,
     fit_score,
     merge_transcripts,
@@ -260,20 +258,8 @@ def test_is_rate_limited_detects_429_variants():
     assert not _is_rate_limited(Exception("403 PermissionDenied: API disabled"))
 
 
-def test_rate_limiter_enforces_minimum_spacing():
-    limiter = _RateLimiter(min_interval=0.05)
-    start = time.monotonic()
-    limiter.wait()
-    limiter.wait()
-    limiter.wait()
-    elapsed = time.monotonic() - start
-    # 3 lần gọi liên tiếp phải cách nhau tối thiểu 2 * min_interval.
-    assert elapsed >= 0.09
-
-
 def test_segment_audio_suffix_follows_tts_engine():
     assert segment_audio_suffix("vieneu") == ".wav"
-    assert segment_audio_suffix("gemini") == ".mp3"
     # Vbee trả MP3 -> dùng chung nhánh mặc định.
     assert segment_audio_suffix("vbee") == ".mp3"
 
@@ -313,10 +299,10 @@ def test_vieneu_infer_kwargs_prefers_ref_audio_over_preset():
 def test_resolve_tts_engine_prefers_job_over_global(monkeypatch):
     # Job đặt riêng engine (qua PATCH /api/jobs, không qua UI) phải thắng cấu hình toàn cục.
     # settings là dataclass frozen -> patch nguyên tên "settings" trong module thay vì field.
-    monkeypatch.setattr(pipeline_module, "settings", SimpleNamespace(tts_engine="gemini"))
+    monkeypatch.setattr(pipeline_module, "settings", SimpleNamespace(tts_engine="vbee"))
     assert resolve_tts_engine({"tts_engine": "vieneu"}) == "vieneu"
-    assert resolve_tts_engine({"tts_engine": None}) == "gemini"
-    assert resolve_tts_engine({}) == "gemini"
+    assert resolve_tts_engine({"tts_engine": None}) == "vbee"
+    assert resolve_tts_engine({}) == "vbee"
 
 
 def test_default_job_speed_stays_within_atempo_range():

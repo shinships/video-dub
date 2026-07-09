@@ -94,12 +94,8 @@ FIT_MAX_RETRIES = 2
 TTS_WORKERS = int(os.getenv("VIDEO_DUB_TTS_WORKERS", "2"))
 BACKOFF_MAX_RETRIES = 6
 BACKOFF_BASE_SECONDS = 8.0
-# Giãn cách chủ động giữa các lần gọi TTS (giây). Quota theo PHÚT bị vượt rất nhanh nếu gọi
-# dồn dập rồi chỉ retry bị động — exponential backoff (tới >4 phút/lần) lãng phí cả cửa sổ
-# quota đã hồi. Giãn cách trước giúp tránh 429 ngay từ đầu thay vì chờ bị từ chối rồi lùi.
-TTS_MIN_INTERVAL_SECONDS = float(os.getenv("VIDEO_DUB_TTS_MIN_INTERVAL", "8"))
 # --- Cắt lặng đầu/đuôi audio TTS trước khi đo độ dài ---
-# Gemini/VieNeu hay đệm 0.1-0.4s im lặng hai đầu -> đo dài giả, kích hoạt viết-lại/tăng tốc
+# VieNeu/Vbee hay đệm 0.1-0.4s im lặng hai đầu -> đo dài giả, kích hoạt viết-lại/tăng tốc
 # oan và gây cảm giác vào câu trễ. Ngưỡng thấp + giữ chút lặng cho êm, tránh cụt phụ âm nhẹ.
 TTS_TRIM_THRESHOLD = "-50dB"
 TTS_TRIM_KEEP = 0.06  # Giây lặng giữ lại mỗi đầu.
@@ -198,28 +194,6 @@ def _pitch_chain(semitones: float, sample_rate: int = 48000) -> str:
         f",asetrate={int(sample_rate * factor)},aresample={sample_rate},"
         f"{_atempo_chain(1.0 / factor, lo=0.5, hi=2.0)}"
     )
-
-
-class _RateLimiter:
-    """Giãn cách tối thiểu giữa các lần gọi, dùng chung qua nhiều luồng (thread-safe).
-    Bổ sung cho _with_backoff: backoff chỉ phản ứng SAU khi bị 429, còn limiter này chủ động
-    né trước để không lãng phí thời gian chờ vào những lần gọi chắc chắn bị từ chối."""
-
-    def __init__(self, min_interval: float):
-        self.min_interval = min_interval
-        self._lock = threading.Lock()
-        self._next_at = 0.0
-
-    def wait(self) -> None:
-        with self._lock:
-            now = time.monotonic()
-            delay = max(0.0, self._next_at - now)
-            self._next_at = max(now, self._next_at) + self.min_interval
-        if delay:
-            time.sleep(delay)
-
-
-_tts_limiter = _RateLimiter(TTS_MIN_INTERVAL_SECONDS)
 
 
 _whisper_lock = threading.Lock()
@@ -424,6 +398,26 @@ def _strip_json(text: str) -> str:
     if fence:
         return fence.group(1).strip()
     return text
+
+
+_translation_list_schema: Any = None
+
+
+def _translation_schema() -> Any:
+    """Schema JSON cho response_schema (Gemini structured output). Không ép response_schema
+    -> model thỉnh thoảng chèn dấu ngoặc kép " chưa escape vào nội dung dịch (vd trích một cụm
+    từ), làm hỏng cú pháp JSON và hỏng NGUYÊN CẢ LÔ (rơi về fallback giữ tiếng Anh cho mọi câu
+    trong lô). response_schema ép model tự tránh/escape đúng, giảm hẳn lỗi này."""
+    global _translation_list_schema
+    if _translation_list_schema is None:
+        from pydantic import BaseModel
+
+        class TranslationItem(BaseModel):
+            index: int
+            vi: str
+
+        _translation_list_schema = list[TranslationItem]
+    return _translation_list_schema
 
 
 def _parse_translations(text: str) -> dict[int, str]:
@@ -781,14 +775,6 @@ class Pipeline:
             ),
         )
 
-    def _tts_client(self):
-        from google.cloud import texttospeech
-
-        return self._cached_client(
-            "tts",
-            lambda: texttospeech.TextToSpeechClient(credentials=_active_gcloud_credentials()),
-        )
-
     def _build_context(self, client, segments: list[dict[str, Any]]) -> str:
         """Pass 1 lần: tóm tắt chủ đề + glossary để dịch nhất quán, sát nghĩa."""
         from google.genai import types
@@ -849,7 +835,9 @@ class Pipeline:
             "ký tự) mà vẫn giữ đủ ý — ưu tiên câu gọn, lược từ đệm thừa thay vì cắt nội dung.\n"
             "Dùng prev/next context để giữ mạch, đại từ và thuật ngữ nhất quán.\n"
             "BẮT BUỘC tuân theo hướng dẫn dịch bên dưới: dùng đúng glossary và đúng cặp xưng hô "
-            "đã chọn cho MỌI câu.\n\n"
+            "đã chọn cho MỌI câu.\n"
+            "TUYỆT ĐỐI KHÔNG dùng dấu ngoặc kép \" trong nội dung dịch (cần trích dẫn một cụm từ "
+            "thì dùng dấu nháy đơn ' hoặc bỏ dấu trích dẫn) vì sẽ làm hỏng cú pháp JSON.\n\n"
             f"--- Hướng dẫn dịch (bối cảnh, glossary, xưng hô) ---\n{context}\n\n"
             f"--- Câu cần dịch (JSON) ---\n{json.dumps(lines, ensure_ascii=False)}\n\n"
             'Trả về DUY NHẤT một JSON array, mỗi phần tử {"index": <int>, "vi": "<bản dịch>"}.'
@@ -862,6 +850,10 @@ class Pipeline:
                     # Nhiệt thấp để cùng thuật ngữ cho ra cùng bản dịch giữa các lô song song.
                     temperature=0.2,
                     response_mime_type="application/json",
+                    response_schema=_translation_schema(),
+                    # Không cần suy luận sâu cho dịch theo lô; tắt thinking vừa nhanh/rẻ hơn vừa
+                    # tránh model tràn ngân sách token vào "thoughts" ẩn rồi cắt cụt câu dịch.
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             ),
             label="dịch theo lô",
@@ -934,6 +926,8 @@ class Pipeline:
                 "song song nên có thể LỆCH NHẤT QUÁN về xưng hô hoặc thuật ngữ giữa các câu.\n"
                 "Dựa vào HƯỚNG DẪN DỊCH, chỉ tìm và sửa những câu dùng SAI cặp xưng hô đã chọn "
                 "hoặc SAI glossary. Giữ nguyên nghĩa, KHÔNG viết lại câu đã đúng.\n\n"
+                "TUYỆT ĐỐI KHÔNG dùng dấu ngoặc kép \" trong nội dung sửa (cần trích dẫn một cụm "
+                "từ thì dùng dấu nháy đơn ' hoặc bỏ dấu trích dẫn) vì sẽ làm hỏng cú pháp JSON.\n\n"
                 f"--- Hướng dẫn dịch ---\n{context}\n\n"
                 f"--- Bản dịch (JSON) ---\n{payload}\n\n"
                 'Trả về DUY NHẤT một JSON array chỉ gồm các câu CẦN sửa, mỗi phần tử '
@@ -946,6 +940,8 @@ class Pipeline:
                     config=types.GenerateContentConfig(
                         temperature=0.1,
                         response_mime_type="application/json",
+                        response_schema=_translation_schema(),
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
                     ),
                 ),
                 label="soát lại bản dịch",
@@ -1010,36 +1006,6 @@ class Pipeline:
             await asyncio.to_thread(self._synthesize_segment, job_id, segment)
         await self.hook(job_id, {"type": "segment", "segment_id": segment_id, "status": "ready"})
 
-    def _tts_bytes(self, text: str, job: dict[str, Any]) -> bytes:
-        from google.cloud import texttospeech
-
-        # Prompt CỐ ĐỊNH cho mọi câu: ép thời lượng theo từng câu ("vừa đúng X giây")
-        # khiến model tự đọc dồn khi khung ngắn, kéo lê khi khung dài — mỗi câu một nhịp.
-        # Khớp độ dài đã có vòng viết-lại + atempo lo; prompt chỉ giữ giọng/nhịp nhất quán.
-        prompt = (
-            f"Đọc bằng tiếng Việt, phong cách {job.get('style', 'tự nhiên')}, rõ ràng, "
-            "tốc độ vừa phải, giữ nhịp đọc đều và ổn định như nhau ở mọi câu, "
-            "tự nhiên như người dẫn chuyện."
-        )
-        client = self._tts_client()
-        _tts_limiter.wait()
-        response = _with_backoff(
-            lambda: client.synthesize_speech(
-                input=texttospeech.SynthesisInput(text=text, prompt=prompt),
-                voice=texttospeech.VoiceSelectionParams(
-                    language_code="vi-VN",
-                    name=job.get("voice", "Aoede"),
-                    model_name=settings.tts_model,
-                ),
-                audio_config=texttospeech.AudioConfig(
-                    audio_encoding=texttospeech.AudioEncoding.MP3,
-                    sample_rate_hertz=24000,
-                ),
-            ),
-            label="tạo giọng (TTS)",
-        )
-        return response.audio_content
-
     def _rewrite_shorter(
         self, source_en: str, current_vi: str, seconds: float, context: str = ""
     ) -> str | None:
@@ -1084,8 +1050,7 @@ class Pipeline:
         text = segment["translated_text"]
 
         # Vòng khớp độ dài: nếu TTS dài hơn khung quá ngưỡng thì viết lại ngắn hơn rồi synth lại.
-        # VieNeu không nhận gợi ý thời lượng như Gemini nhưng vòng này (đo thật + viết lại
-        # + atempo lúc render) vẫn khống chế được độ dài cho cả hai engine.
+        # Đo thật + viết lại + atempo lúc render vẫn khống chế được độ dài cho cả hai engine.
         context = (job.get("artifacts") or {}).get("translate_context", "")
         duration = 0.0
         for attempt in range(FIT_MAX_RETRIES + 1):
@@ -1094,7 +1059,9 @@ class Pipeline:
             elif engine == "vbee":
                 _synth_vbee(text, output)
             else:
-                output.write_bytes(self._tts_bytes(text, job))
+                raise PipelineError(
+                    f"Engine TTS không hỗ trợ: {engine!r}. Chỉ dùng 'vieneu' hoặc 'vbee'."
+                )
             _trim_silence(output)
             duration = probe_audio(output)
             if duration <= seconds * FIT_TOLERANCE or attempt == FIT_MAX_RETRIES:
