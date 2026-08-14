@@ -10,7 +10,7 @@ from .config import settings
 from .db import connect, get_job, now_iso
 from .pipeline import DEFAULT_JOB_SPEED, PipelineError, probe
 
-MAX_DURATION_SECONDS = 1800  # 30 phút
+MAX_DURATION_SECONDS = 14400  # 240 phút (4 giờ)
 
 
 def is_url(source: str) -> bool:

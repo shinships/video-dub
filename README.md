@@ -73,9 +73,24 @@ VIDEO_DUB_VIENEU_REF_AUDIO=
 
 [VieNeu-TTS](https://github.com/pnnbao97/VieNeu-TTS) chạy hoàn toàn local (CPU dùng
 ONNX Runtime, không cần torch; có GPU thì `pip install "vieneu[gpu]"`), miễn phí và
-không dính quota. Đây là engine TTS **mặc định**. Bước dịch vẫn dùng Gemini qua Vertex
-AI. Chọn giọng qua `VIDEO_DUB_VIENEU_VOICE` hoặc nhân bản qua `VIDEO_DUB_VIENEU_REF_AUDIO`
-(UI chỉ hiển thị giọng đang cấu hình, không đổi trực tiếp).
+không dính quota. Đây là engine TTS **mặc định**. Bước dịch vẫn dùng Gemini qua Vertex AI.
+
+Bản v3turbo (mode mặc định của SDK) có sẵn **10 giọng preset**, đọc thẳng từ
+`vieneu/assets/voices_v3_turbo.json` nên UI liệt kê được mà không phải nạp model:
+
+| Giọng | | Giọng | |
+|---|---|---|---|
+| Ngọc Lan | nữ, dịu dàng | Trúc Ly | nữ, trẻ trung |
+| Mỹ Duyên | nữ, mượt mà | Ngọc Linh | nữ, tươi sáng |
+| Gia Bảo | nam, mượt mà | Xuân Vĩnh | nam, vui tươi |
+| Thái Sơn | nam, chắc khỏe | Trọng Hữu | nam, uyên bác |
+| Đức Trí | nam, rõ ràng | Bình An | nam, điềm đạm |
+
+Chọn giọng trên dropdown "Giọng nói" (lưu vào `jobs.voice`, thắng cấu hình env cho job đó),
+hoặc đặt mặc định qua `VIDEO_DUB_VIENEU_VOICE`, hoặc nhân bản giọng riêng qua
+`VIDEO_DUB_VIENEU_REF_AUDIO` (wav 3-5s, thắng preset trong env). Đặt sai tên giọng thì
+backend báo lỗi ngay khi **bắt đầu xử lý** job và log cảnh báo lúc khởi động — không để tới
+bước tạo giọng mới vỡ sau khi đã tốn STT + tiền dịch.
 
 Muốn đổi engine cho **một job cụ thể** (không đổi cấu hình chung) mà không có nút trên
 UI? Xem [AI-CHAT.md](AI-CHAT.md) — yêu cầu trực tiếp trong chat với Claude Code.
@@ -89,13 +104,23 @@ Vbee rồi đặt trong `.env`:
 VIDEO_DUB_TTS_ENGINE=vbee
 VIDEO_DUB_VBEE_APP_ID=<app-id>
 VIDEO_DUB_VBEE_TOKEN=<token>
-# voiceCode; xem danh sách bằng GET https://vbee.vn/api/public/v1/voices?languageCode=vi-VN
+# voiceCode mặc định; danh sách giọng hiện ngay trên UI (lấy từ API voices của Vbee)
 VIDEO_DUB_VBEE_VOICE=hn_female_ngochuyen_full_48k-fhg
+# auto (mặc định) | sync | async — xem bên dưới
+VIDEO_DUB_VBEE_MODE=auto
 ```
 
-Bước tạo giọng gọi Vbee qua HTTP **bất đồng bộ** (gói tài khoản phổ biến không mở chế độ
-sync): POST tạo yêu cầu → poll tới `COMPLETED` → tải MP3 về. Bước dịch vẫn dùng Gemini qua
-Vertex AI. Khi engine là `vbee`, chọn giọng qua `VIDEO_DUB_VBEE_VOICE`.
+Bước tạo giọng đi **Realtime API** (`mode: sync`, trả thẳng MP3 trong ~1s) cho đoạn ≤ 300 ký
+tự, và **tự lùi về Batch API** (`mode: async`: POST → poll `COMPLETED` → tải MP3) khi đoạn dài
+hơn, khi sync lỗi, hoặc khi gói tài khoản chưa mở Realtime (Vbee trả *"not supported in user
+package"* — lúc đó cả tiến trình chuyển hẳn sang async, chỉ báo một lần). Ép một đường cố định
+bằng `VIDEO_DUB_VBEE_MODE=sync|async`.
+
+Giọng: dropdown "Giọng nói" trong cột cài đặt liệt kê giọng Vbee thật (gọi
+`GET https://vbee.vn/api/public/v1/voices`, cache 10 phút); chọn giọng nào thì job lưu vào
+`jobs.voice` và dùng đúng giọng đó khi export. Không gọi được API (thiếu credential/offline)
+thì UI lùi về đúng giọng trong `VIDEO_DUB_VBEE_VOICE`. Khi bật lồng tiếng 2 giọng, giọng
+nam/nữ theo env vẫn thắng lựa chọn trên UI. Bước dịch vẫn dùng Gemini qua Vertex AI.
 
 ## Lồng tiếng 2 giọng (nam/nữ)
 

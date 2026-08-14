@@ -65,7 +65,14 @@ cd backend; ..\.venv\Scripts\python -m pytest -q
    có **vòng khớp độ dài**: đo TTS thật, nếu dài quá `FIT_TOLERANCE` thì `_rewrite_shorter`
    rồi synth lại (≤ `FIT_MAX_RETRIES`). Trước khi đo, `_trim_silence` cắt lặng đầu/đuôi audio
    TTS (đo chính xác, bớt vào câu trễ). Giọng mỗi đoạn do `resolve_segment_voice` chọn theo
-   `speaker` khi bật `multi_speaker` (nam/nữ), ngược lại dùng giọng mặc định 1-giọng như cũ.
+   `speaker` khi bật `multi_speaker` (nam/nữ), ngược lại dùng giọng chọn trên UI (`jobs.voice`)
+   rồi mới tới giọng mặc định trong env. Danh sách giọng cho UI: `fetch_vbee_voices` (API Vbee,
+   cache 10 phút) và `vieneu_preset_voices` (đọc `assets/voices_v3_turbo.json` trong package,
+   **không nạp model**); tên giọng VieNeu sai được `ensure_engine_voices_ready` chặn ngay đầu
+   `_real_process_sync`/`export` thay vì vỡ ở bước TTS.
+   Engine `vbee` đi **Realtime (`mode: sync`)** cho đoạn ≤ `VBEE_SYNC_MAX_CHARS` và **tự lùi về
+   Batch async** (`_synth_vbee_async`) khi đoạn dài, sync lỗi, hoặc gói tài khoản chưa mở sync
+   (cờ `_vbee_sync_blocked` tắt sync cho cả tiến trình). Ép đường đi qua `VIDEO_DUB_VBEE_MODE`.
 6. `_render` (FFmpeg): mỗi đoạn `atempo` theo `segment_tempo` (không kéo chậm câu ngắn;
    câu dài tràn sang khoảng lặng trước khi tăng tốc, kẹp `ATEMPO_MAX`) + `adelay`; bus thoại
    chuẩn `-16 LUFS`; **giữ nền gốc bằng ducking động** (`sidechaincompress`); mix cuối qua

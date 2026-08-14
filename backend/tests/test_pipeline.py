@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import app.pipeline as pipeline_module
 from app.pipeline import (
     ATEMPO_MAX,
@@ -22,8 +24,15 @@ from app.pipeline import (
     segment_median_f0,
     segment_tempo,
     split_sentences,
+    ensure_engine_voices_ready,
+    parse_vbee_voices,
+    parse_vieneu_voices,
+    unknown_vieneu_voices,
     vbee_read,
     vbee_request_payload,
+    vbee_should_try_sync,
+    vbee_sync_outcome,
+    vbee_sync_payload,
     vieneu_infer_kwargs,
 )
 
@@ -326,6 +335,94 @@ def test_resolve_segment_voice_vbee_by_gender():
     assert resolve_segment_voice("vbee", None, True, cfg) == "v_default"
 
 
+def test_resolve_segment_voice_vbee_prefers_job_voice():
+    # Giọng chọn trên UI (jobs.voice) thắng env ở chế độ 1-giọng...
+    cfg = _voice_cfg()
+    assert resolve_segment_voice("vbee", None, False, cfg, job_voice="sg_male_x") == "sg_male_x"
+    # ...nhưng "Aoede" (giọng Vertex AI, mặc định cũ của cột jobs.voice) không phải voiceCode Vbee.
+    assert resolve_segment_voice("vbee", None, False, cfg, job_voice="Aoede") == "v_default"
+    assert resolve_segment_voice("vbee", None, False, cfg, job_voice="") == "v_default"
+    assert resolve_segment_voice("vbee", None, False, cfg, job_voice=None) == "v_default"
+    # Lồng tiếng 2 giọng: giọng nam/nữ theo env vẫn thắng lựa chọn trên UI.
+    assert resolve_segment_voice("vbee", "female", True, cfg, job_voice="sg_male_x") == "v_female"
+
+
+def test_resolve_segment_voice_vieneu_prefers_job_voice_over_ref_audio():
+    # Giọng preset chọn trên UI là chỉ định rõ ràng -> thắng cả ref_audio (nhân bản) trong env.
+    cfg = _voice_cfg()
+    cfg.vieneu_ref_audio = "clone.wav"
+    assert resolve_segment_voice("vieneu", None, False, cfg, job_voice="Trúc Ly") == {"voice": "Trúc Ly"}
+    assert resolve_segment_voice("vieneu", None, False, cfg) == {"ref_audio": "clone.wav"}
+    # Multi bật -> giọng theo giới tính trong env vẫn thắng lựa chọn trên UI.
+    assert resolve_segment_voice("vieneu", "female", True, cfg, job_voice="Trúc Ly") == {
+        "voice": "vn_female"
+    }
+
+
+def test_resolve_segment_voice_ignores_voice_from_other_engine():
+    # Job chọn giọng Vbee rồi đổi engine sang VieNeu: voiceCode Vbee không phải preset VieNeu,
+    # dùng bừa sẽ ném ValueError lúc synth -> phải lùi về giọng cấu hình trong env.
+    cfg = _voice_cfg()
+    known = ["Trúc Ly", "Đức Trí"]
+    assert resolve_segment_voice(
+        "vieneu", None, False, cfg, job_voice="hn_female_ngochuyen_full_48k-fhg", known_voices=known
+    ) == {"voice": "vn_default"}
+    assert resolve_segment_voice(
+        "vieneu", None, False, cfg, job_voice="Trúc Ly", known_voices=known
+    ) == {"voice": "Trúc Ly"}
+
+
+def test_parse_vieneu_voices_reads_presets():
+    voices = parse_vieneu_voices(
+        {
+            "default_voice": "Ngọc Linh",
+            "presets": {
+                "Ngọc Lan": {"description": "nữ, giọng dịu dàng", "gender": "nữ", "codes": [1, 2]},
+                "Gia Bảo": {"description": "nam, giọng mượt mà", "gender": "nam", "codes": [3]},
+            },
+        }
+    )
+    # Tên preset chính là giá trị đặt cho VIDEO_DUB_VIENEU_VOICE.
+    assert [voice["id"] for voice in voices] == ["Ngọc Lan", "Gia Bảo"]
+    assert voices[0]["desc"] == "nữ, giọng dịu dàng"
+    assert voices[1]["gender"] == "nam"
+    # Thân JSON lạ/rỗng -> rỗng chứ không ném lỗi.
+    assert parse_vieneu_voices({}) == []
+
+
+def test_unknown_vieneu_voices_flags_only_presets_without_ref_audio():
+    cfg = _voice_cfg()
+    cfg.vieneu_voice = "Đức Trí"
+    cfg.vieneu_voice_male = "Không Có Thật"
+    cfg.vieneu_voice_female = "Cũng Không"
+    # Giọng nữ có ref_audio -> preset bị bỏ qua khi synth nên không tính là sai.
+    cfg.vieneu_ref_audio_female = "female.wav"
+    assert unknown_vieneu_voices(cfg, known=["Đức Trí", "Ngọc Lan"]) == ["Không Có Thật"]
+    # Không đọc được preset -> không kết luận, tránh báo lỗi oan.
+    assert unknown_vieneu_voices(cfg, known=[]) == []
+
+
+def test_ensure_engine_voices_ready_raises_only_for_bad_vieneu_config(monkeypatch):
+    monkeypatch.setattr(pipeline_module, "vieneu_preset_voices", lambda: [{"id": "Đức Trí"}])
+    monkeypatch.setattr(
+        pipeline_module,
+        "settings",
+        SimpleNamespace(
+            vieneu_voice="Sai Tên",
+            vieneu_ref_audio="",
+            vieneu_voice_male="",
+            vieneu_ref_audio_male="",
+            vieneu_voice_female="",
+            vieneu_ref_audio_female="",
+        ),
+    )
+    with pytest.raises(pipeline_module.PipelineError) as err:
+        ensure_engine_voices_ready("vieneu")
+    assert "Sai Tên" in str(err.value) and "Đức Trí" in str(err.value)
+    # Vbee không kiểm tra offline được -> không chặn.
+    ensure_engine_voices_ready("vbee")
+
+
 def test_resolve_segment_voice_vieneu_by_gender():
     cfg = _voice_cfg()
     assert resolve_segment_voice("vieneu", "female", True, cfg) == {"voice": "vn_female"}
@@ -431,7 +528,7 @@ def test_segment_audio_suffix_follows_tts_engine():
 
 
 def test_vbee_request_payload_uses_async_mode():
-    # Gói Vbee thường không mở sync -> luôn async, có webhookUrl bắt buộc dù ta chỉ poll.
+    # Đường Batch: mode async, có webhookUrl bắt buộc dù ta chỉ poll.
     payload = vbee_request_payload("Xin chào", "hn_female_ngochuyen_full_48k-fhg")
     assert payload["mode"] == "async"
     assert payload["text"] == "Xin chào"
@@ -453,6 +550,77 @@ def test_vbee_read_handles_post_poll_and_error_shapes():
     # Lỗi -> lấy message, không có request_id.
     err = vbee_read({"error": {"code": "BAD_REQUEST", "message": "thiếu webhookUrl"}})
     assert err["request_id"] is None and err["error"] == "thiếu webhookUrl"
+
+
+def test_vbee_sync_payload_has_no_webhook():
+    # Realtime API trả thẳng audio -> không requestId/webhookUrl như đường Batch.
+    payload = vbee_sync_payload("Xin chào", "hn_female_ngochuyen_full_48k-fhg")
+    assert payload["mode"] == "sync"
+    assert payload["voiceCode"] == "hn_female_ngochuyen_full_48k-fhg"
+    assert payload["outputFormat"] == "mp3"
+    assert "webhookUrl" not in payload
+
+
+def test_vbee_should_try_sync_respects_limit_mode_and_block():
+    short = "Xin chào các bạn"
+    long_text = "a" * (pipeline_module.VBEE_SYNC_MAX_CHARS + 1)
+    assert vbee_should_try_sync(short, mode="auto", blocked=False)
+    # Trần 300 ký tự áp cả khi ép sync — câu dài buộc đi Batch.
+    assert not vbee_should_try_sync(long_text, mode="sync", blocked=False)
+    assert not vbee_should_try_sync(short, mode="async", blocked=False)
+    # Đã biết gói không mở sync -> không thử lại ở các đoạn sau.
+    assert not vbee_should_try_sync(short, mode="auto", blocked=True)
+
+
+def test_vbee_sync_outcome_classifies_audio_blocked_and_fallback():
+    assert vbee_sync_outcome(200, "audio/mpeg", b"ID3data") == ("audio", "")
+    # Body rỗng dù status 200 -> không ghi file rỗng, lùi về async.
+    assert vbee_sync_outcome(200, "audio/mpeg", b"")[0] == "fallback"
+    blocked = vbee_sync_outcome(
+        400,
+        "application/json",
+        json.dumps(
+            {"error": {"code": "BAD_REQUEST", "message": "This feature is not supported in user package"}}
+        ).encode(),
+    )
+    assert blocked[0] == "blocked" and "user package" in blocked[1]
+    # Vượt giới hạn đồng thời -> chỉ đoạn này lùi về async, không tắt sync cả tiến trình.
+    busy = vbee_sync_outcome(
+        429,
+        "application/json",
+        json.dumps({"error": {"code": "TTS_CCR_MAX_LIMIT_REACHED", "message": "quá tải"}}).encode(),
+    )
+    assert busy == ("fallback", "quá tải")
+    # Thân không phải JSON hợp lệ vẫn phải ra fallback kèm mã HTTP.
+    assert vbee_sync_outcome(500, "text/html", b"<html>")[0] == "fallback"
+
+
+def test_parse_vbee_voices_reads_codes_and_cursor():
+    voices, cursor = parse_vbee_voices(
+        {
+            "result": {
+                "voices": [
+                    {
+                        "code": "hn_female_ngochuyen_full_48k-fhg",
+                        "name": "HN - Ngọc Huyền",
+                        "gender": "female",
+                        "language_code": "vi-VN",
+                    },
+                    {"name": "thiếu code"},
+                ],
+                "pagination": {"next_cursor": "abc", "has_next_page": True},
+            }
+        }
+    )
+    assert cursor == "abc"
+    # Bản ghi thiếu code bị bỏ (không dùng làm voiceCode được).
+    assert len(voices) == 1
+    assert voices[0]["id"] == "hn_female_ngochuyen_full_48k-fhg"
+    assert voices[0]["label"] == "HN - Ngọc Huyền"
+    assert voices[0]["gender"] == "female"
+    assert "female" in voices[0]["desc"]
+    # Thân JSON lạ/rỗng -> rỗng chứ không ném lỗi (UI vẫn chạy).
+    assert parse_vbee_voices({}) == ([], None)
 
 
 def test_vieneu_infer_kwargs_prefers_ref_audio_over_preset():

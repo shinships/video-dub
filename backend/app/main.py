@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sys
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -17,7 +18,15 @@ from pydantic import BaseModel, Field
 from .config import settings
 from . import service
 from .db import get_job, init_db, list_jobs, update_job, update_segment
-from .pipeline import Pipeline, PipelineError, fit_score, seed_demo_job
+from .pipeline import (
+    Pipeline,
+    PipelineError,
+    fetch_vbee_voices,
+    fit_score,
+    seed_demo_job,
+    unknown_vieneu_voices,
+    vieneu_preset_voices,
+)
 
 
 queues: dict[str, set[asyncio.Queue[dict[str, Any]]]] = defaultdict(set)
@@ -45,6 +54,15 @@ async def worker() -> None:
 async def lifespan(_: FastAPI):
     init_db()
     seed_demo_job()
+    # Cảnh báo (không chặn khởi động) khi VIDEO_DUB_VIENEU_VOICE* trỏ tới giọng không có thật:
+    # job sẽ hỏng ngay khi bắt đầu xử lý, biết trước từ log vẫn hơn.
+    if settings.tts_engine == "vieneu":
+        unknown = unknown_vieneu_voices()
+        if unknown:
+            print(
+                f"[cảnh báo] Giọng VieNeu không tồn tại trong preset: {', '.join(unknown)}.",
+                file=sys.stderr,
+            )
     task = asyncio.create_task(worker())
     yield
     task.cancel()
@@ -93,10 +111,45 @@ def health() -> dict[str, Any]:
     }
 
 
+def _vbee_voice_options() -> list[dict[str, Any]]:
+    """Giọng Vbee cho UI: lấy danh sách thật từ API (có cache), lùi về giọng cấu hình trong env
+    khi không gọi được. Luôn đảm bảo giọng env có trong danh sách để lựa chọn khớp cấu hình."""
+    voices = fetch_vbee_voices()
+    if not voices:
+        return [
+            {
+                "id": settings.vbee_voice,
+                "label": settings.vbee_voice,
+                "desc": "Đặt qua VIDEO_DUB_VBEE_VOICE",
+            }
+        ]
+    if settings.vbee_voice and not any(item["id"] == settings.vbee_voice for item in voices):
+        voices.insert(
+            0,
+            {
+                "id": settings.vbee_voice,
+                "label": settings.vbee_voice,
+                "desc": "Đặt qua VIDEO_DUB_VBEE_VOICE",
+            },
+        )
+    return voices
+
+
+def _vieneu_voice_options() -> list[dict[str, Any]]:
+    """Giọng VieNeu cho UI: preset đóng gói sẵn trong package (không phải nạp model). Không đọc
+    được (chưa cài vieneu) -> lùi về đúng giọng cấu hình trong env như trước."""
+    voices = vieneu_preset_voices()
+    if not voices:
+        name = settings.vieneu_voice or "default"
+        return [{"id": name, "label": f"Giọng {name}", "desc": "Đặt qua VIDEO_DUB_VIENEU_VOICE"}]
+    return voices
+
+
 @app.get("/api/voices")
 def voices() -> dict[str, Any]:
-    """Danh sách engine TTS (tĩnh, không gọi cloud). Chỉ VieNeu và Vbee; Gemini TTS đã bỏ.
-    Kèm giọng nam/nữ dùng khi bật lồng tiếng 2 giọng (multi_speaker)."""
+    """Danh sách engine TTS. Chỉ VieNeu và Vbee; Gemini TTS đã bỏ. Giọng VieNeu lấy từ preset
+    đóng gói trong package, giọng Vbee lấy từ API voices (cache 10 phút). Kèm giọng nam/nữ dùng
+    khi bật lồng tiếng 2 giọng (multi_speaker)."""
     vieneu_voice = settings.vieneu_voice or "default"
     vieneu_male = settings.vieneu_voice_male or settings.vieneu_ref_audio_male or vieneu_voice
     vieneu_female = settings.vieneu_voice_female or settings.vieneu_ref_audio_female or "(chưa đặt)"
@@ -107,25 +160,13 @@ def voices() -> dict[str, Any]:
             {
                 "id": "vieneu",
                 "label": "VieNeu (chạy local)",
-                "voices": [
-                    {
-                        "id": vieneu_voice,
-                        "label": f"Giọng {vieneu_voice}",
-                        "desc": "Đặt qua VIDEO_DUB_VIENEU_VOICE",
-                    }
-                ],
+                "voices": _vieneu_voice_options(),
                 "gendered_voices": {"male": vieneu_male, "female": vieneu_female},
             },
             {
                 "id": "vbee",
                 "label": "Vbee (cloud)",
-                "voices": [
-                    {
-                        "id": settings.vbee_voice,
-                        "label": settings.vbee_voice,
-                        "desc": "Đặt qua VIDEO_DUB_VBEE_VOICE",
-                    }
-                ],
+                "voices": _vbee_voice_options(),
                 "gendered_voices": {
                     "male": settings.vbee_voice_male or settings.vbee_voice,
                     "female": settings.vbee_voice_female or settings.vbee_voice,

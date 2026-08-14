@@ -63,6 +63,11 @@ VIDEO_CODEC = "libx264"
 VIDEO_PRESET = "veryfast"
 VIDEO_CRF = "18"
 
+# --- Tham số Ngôn ngữ gốc ---
+SOURCE_LANG_CODE = os.environ.get("VIDEO_DUB_SOURCE_LANG", "en")
+SOURCE_LANG_GOOGLE = os.environ.get("VIDEO_DUB_SOURCE_LANG_GOOGLE", "en-US")
+SOURCE_LANG_NAME = os.environ.get("VIDEO_DUB_SOURCE_LANG_NAME", "Anh")
+
 # --- Tham số dịch ---
 TRANSLATE_BATCH = 40  # Số câu mỗi lời gọi Gemini (dịch theo lô).
 TRANSLATE_WORKERS = 4  # Số lô dịch song song.
@@ -247,6 +252,83 @@ def vieneu_infer_kwargs(voice: str, ref_audio: str) -> dict[str, str]:
     return {}
 
 
+# Giọng preset VieNeu nằm sẵn trong package (assets/voices_v3_turbo.json của mode v3turbo —
+# mode mặc định của factory Vieneu()). Đọc thẳng file JSON nên KHÔNG phải nạp model: /api/voices
+# và bước kiểm tra cấu hình chạy được cả khi máy chưa từng load VieNeu.
+VIENEU_VOICES_ASSET = "voices_v3_turbo.json"
+_vieneu_voices_cache: list[dict[str, Any]] | None = None
+
+
+def parse_vieneu_voices(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Bóc preset giọng từ voices_v3_turbo.json -> [{id, label, desc, gender}].
+    Tên preset (khoá) chính là giá trị đặt cho VIDEO_DUB_VIENEU_VOICE."""
+    presets = data.get("presets") if isinstance(data.get("presets"), dict) else {}
+    voices: list[dict[str, Any]] = []
+    for name, item in presets.items():
+        if not name:
+            continue
+        info = item if isinstance(item, dict) else {}
+        gender = info.get("gender") or ""
+        description = info.get("description") or ""
+        voices.append(
+            {
+                "id": name,
+                "label": name,
+                "desc": description or gender,
+                "gender": gender,
+            }
+        )
+    return voices
+
+
+def vieneu_preset_voices() -> list[dict[str, Any]]:
+    """Danh sách giọng preset VieNeu (cache theo tiến trình). Chưa cài vieneu / thiếu asset
+    -> rỗng, nơi gọi tự lùi về giọng cấu hình trong env."""
+    global _vieneu_voices_cache
+
+    if _vieneu_voices_cache is not None:
+        return list(_vieneu_voices_cache)
+    try:
+        import vieneu
+
+        asset = Path(vieneu.__file__).parent / "assets" / VIENEU_VOICES_ASSET
+        voices = parse_vieneu_voices(json.loads(asset.read_text(encoding="utf-8")))
+    except Exception as exc:
+        print(f"[vieneu] không đọc được danh sách giọng preset: {exc}", file=sys.stderr)
+        voices = []
+    _vieneu_voices_cache = voices
+    return list(voices)
+
+
+def unknown_vieneu_voices(cfg: Any = None, known: list[str] | None = None) -> list[str]:
+    """Các giọng VieNeu cấu hình trong env nhưng không có trong preset. VieNeu ném
+    ValueError('Voice ... not found') ngay lúc synth, nên bắt sớm ở đây để không vỡ sau khi
+    đã tốn STT + dịch. Giọng nào có ref_audio (nhân bản) thì preset không được dùng -> bỏ qua."""
+    cfg = settings if cfg is None else cfg  # đọc settings lúc gọi, không bind lúc định nghĩa
+    if known is None:
+        known = [voice["id"] for voice in vieneu_preset_voices()]
+    if not known:  # không đọc được preset -> không kết luận gì, tránh báo lỗi oan
+        return []
+    candidates = [
+        (cfg.vieneu_voice, cfg.vieneu_ref_audio),
+        (cfg.vieneu_voice_male, cfg.vieneu_ref_audio_male),
+        (cfg.vieneu_voice_female, cfg.vieneu_ref_audio_female),
+    ]
+    return [voice for voice, ref_audio in candidates if voice and not ref_audio and voice not in known]
+
+
+def ensure_engine_voices_ready(engine: str) -> None:
+    """Chặn sớm khi giọng cấu hình sai tên (chỉ VieNeu kiểm tra được offline)."""
+    if engine != "vieneu":
+        return
+    unknown = unknown_vieneu_voices()
+    if unknown:
+        available = ", ".join(voice["id"] for voice in vieneu_preset_voices())
+        raise PipelineError(
+            f"Giọng VieNeu không tồn tại: {', '.join(unknown)}. Giọng hợp lệ: {available}."
+        )
+
+
 def segment_audio_suffix(engine: str) -> str:
     """Đuôi file audio đoạn theo engine: VieNeu save ra WAV, Gemini trả bytes MP3."""
     return ".wav" if engine == "vieneu" else ".mp3"
@@ -258,22 +340,42 @@ def resolve_tts_engine(job: dict[str, Any]) -> str:
     return job.get("tts_engine") or settings.tts_engine
 
 
+# Giọng "chưa chọn" trong DB: "Aoede" là tên giọng của Vertex AI (engine TTS cũ, đã bỏ) và vẫn
+# đang là mặc định của cột jobs.voice — không phải voiceCode Vbee nên phải bỏ qua, dùng giọng
+# cấu hình trong env.
+LEGACY_VOICE_PLACEHOLDERS = {None, "", "Aoede"}
+
+
 def resolve_segment_voice(
-    engine: str, speaker: str | None, multi_speaker: bool, cfg: Any = settings
+    engine: str,
+    speaker: str | None,
+    multi_speaker: bool,
+    cfg: Any = settings,
+    job_voice: str | None = None,
+    known_voices: list[str] | None = None,
 ) -> Any:
     """Chọn giọng cho một đoạn: trả voiceCode (str) cho Vbee, infer_kwargs (dict) cho VieNeu.
     Multi-speaker TẮT (hoặc speaker không phải nam/nữ) -> giọng mặc định 1-giọng như cũ. BẬT:
     female -> giọng nữ, male -> giọng nam; giọng giới tính chưa cấu hình thì fallback về mặc
-    định (giọng nam mặc định kế thừa cấu hình 1-giọng nên không phải khai lại)."""
+    định (giọng nam mặc định kế thừa cấu hình 1-giọng nên không phải khai lại).
+    Giọng chọn trên UI (job_voice) thắng env ở chế độ 1-giọng; truyền known_voices để bỏ qua
+    giọng của engine khác (job đổi engine sau khi đã chọn giọng thì jobs.voice không còn hợp lệ)."""
+    if job_voice in LEGACY_VOICE_PLACEHOLDERS or (
+        known_voices is not None and job_voice not in known_voices
+    ):
+        job_voice = None
     if engine == "vbee":
-        default = cfg.vbee_voice
+        default = job_voice or cfg.vbee_voice
         if not multi_speaker or speaker not in ("male", "female"):
             return default
         if speaker == "female":
             return cfg.vbee_voice_female or default
         return cfg.vbee_voice_male or default
-    # VieNeu (và mọi engine local khác dùng infer_kwargs).
-    default_kwargs = vieneu_infer_kwargs(cfg.vieneu_voice, cfg.vieneu_ref_audio)
+    # VieNeu (và mọi engine local khác dùng infer_kwargs): giọng chọn trên UI là preset, nên
+    # thắng cả ref_audio trong env (người dùng vừa chỉ định rõ giọng khác).
+    default_kwargs = (
+        {"voice": job_voice} if job_voice else vieneu_infer_kwargs(cfg.vieneu_voice, cfg.vieneu_ref_audio)
+    )
     if not multi_speaker or speaker not in ("male", "female"):
         return default_kwargs
     if speaker == "female":
@@ -286,6 +388,8 @@ def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None =
     model giữ trạng thái nội bộ nên không an toàn khi gọi song song, và suy luận vốn
     nghẽn CPU — chạy tuần tự không làm chậm thêm so với chạy chồng lên nhau."""
     global _vieneu_model
+    import re
+    import numpy as np
     with _vieneu_lock:
         if _vieneu_model is None:
             from vieneu import Vieneu
@@ -293,19 +397,78 @@ def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None =
             _vieneu_model = Vieneu(device=settings.vieneu_device)
         if infer_kwargs is None:
             infer_kwargs = vieneu_infer_kwargs(settings.vieneu_voice, settings.vieneu_ref_audio)
-        audio = _vieneu_model.infer(text, **infer_kwargs)
-        _vieneu_model.save(audio, str(output))
+        
+        # Split text to avoid OOM on long segments
+        max_len = 50
+        parts = re.split(r'([.,:;?!]+)', text)
+        chunks = []
+        current = ""
+        for part in parts:
+            if len(current) + len(part) <= max_len:
+                current += part
+            else:
+                if current:
+                    chunks.append(current.strip())
+                current = part
+        if current:
+            chunks.append(current.strip())
+        
+        final_chunks = []
+        for c in chunks:
+            while len(c) > max_len:
+                idx = c.rfind(' ', 0, max_len)
+                if idx == -1: idx = max_len
+                final_chunks.append(c[:idx].strip())
+                c = c[idx:].strip()
+            if c:
+                final_chunks.append(c)
+        
+        audios = []
+        for chunk in final_chunks:
+            if not chunk: continue
+            try:
+                a = _vieneu_model.infer(chunk, **infer_kwargs)
+                audios.append(a)
+            except Exception:
+                # If ONNX memory error occurs on a chunk, split in half and retry
+                mid = len(chunk) // 2
+                idx = chunk.rfind(' ', 0, mid)
+                if idx == -1: idx = mid
+                sub1, sub2 = chunk[:idx].strip(), chunk[idx:].strip()
+                if sub1:
+                    audios.append(_vieneu_model.infer(sub1, **infer_kwargs))
+                if sub2:
+                    audios.append(_vieneu_model.infer(sub2, **infer_kwargs))
+        
+        if not audios:
+            # Fallback for empty
+            audios = [np.zeros(1, dtype=np.float32)]
+            
+        final_audio = np.concatenate(audios, axis=0)
+        _vieneu_model.save(final_audio, str(output))
+        import gc
+        gc.collect()
 
 
-# --- Vbee TTS (cloud tiếng Việt qua HTTP bất đồng bộ) ---
+# --- Vbee TTS (cloud tiếng Việt qua HTTP) ---
 VBEE_API_URL = "https://api.vbee.vn/v1/tts"
-# Gói tài khoản Vbee thường KHÔNG mở chế độ sync ("This feature is not supported in user
-# package") -> đi đường async: POST nhận requestId, poll GET .../requests/{id} tới COMPLETED
-# rồi tải audioLink. webhookUrl bắt buộc dù ta không dùng webhook (chỉ poll) nên đặt placeholder.
+# Hai đường đi cùng một URL: Realtime (mode "sync", trả thẳng audio, ~500ms, trần 300 ký tự) và
+# Batch (mode "async": POST nhận requestId, poll GET .../requests/{id} tới COMPLETED rồi tải
+# audioLink). Sync nhanh hơn hẳn nhưng có gói tài khoản không mở -> luôn có đường lùi về async.
+# webhookUrl bắt buộc ở chế độ async dù ta không dùng webhook (chỉ poll) nên đặt placeholder.
 VBEE_WEBHOOK_PLACEHOLDER = os.getenv("VIDEO_DUB_VBEE_WEBHOOK", "https://example.com/vbee-webhook")
 VBEE_POLL_INTERVAL = 2.0  # Giây giữa mỗi lần poll trạng thái.
 VBEE_POLL_TIMEOUT = 180.0  # Trần chờ một đoạn TTS xong (giây).
 VBEE_HTTP_TIMEOUT = 60.0  # Timeout mỗi HTTP call (giây).
+VBEE_SYNC_MAX_CHARS = 300  # Trần ký tự của Realtime API; dài hơn buộc đi async.
+VBEE_SYNC_TIMEOUT = 30.0  # Sync trả trong ~1s, chờ lâu hơn thế thì lùi về async cho nhanh.
+# auto = thử sync cho câu ngắn rồi tự lùi; async = ép Batch như cũ; sync = ưu tiên sync.
+VBEE_MODE = os.getenv("VIDEO_DUB_VBEE_MODE", "auto").strip().lower()
+# Thông điệp Vbee trả khi gói tài khoản chưa mở Realtime -> tắt sync cho cả tiến trình, khỏi
+# tốn một round-trip lỗi cho từng đoạn.
+VBEE_SYNC_UNSUPPORTED = "not supported in user package"
+_vbee_sync_blocked = False
+_vbee_sync_lock = threading.Lock()
 
 
 def vbee_request_payload(text: str, voice: str) -> dict[str, Any]:
@@ -317,6 +480,46 @@ def vbee_request_payload(text: str, voice: str) -> dict[str, Any]:
         "mode": "async",
         "webhookUrl": VBEE_WEBHOOK_PLACEHOLDER,
     }
+
+
+def vbee_sync_payload(text: str, voice: str) -> dict[str, Any]:
+    """Body POST Realtime API (mode sync): trả thẳng audio, không có webhookUrl/requestId."""
+    return {
+        "text": text,
+        "voiceCode": voice,
+        "outputFormat": "mp3",
+        "mode": "sync",
+    }
+
+
+def vbee_should_try_sync(text: str, mode: str | None = None, blocked: bool | None = None) -> bool:
+    """Có nên thử Realtime API cho đoạn này không. Trần 300 ký tự áp cả khi ép mode=sync
+    (câu dài Vbee sẽ từ chối) và cờ blocked chặn hẳn sau lần đầu biết gói không hỗ trợ."""
+    mode = VBEE_MODE if mode is None else mode
+    blocked = _vbee_sync_blocked if blocked is None else blocked
+    if mode == "async" or blocked:
+        return False
+    return len(text) <= VBEE_SYNC_MAX_CHARS
+
+
+def vbee_sync_outcome(status_code: int, content_type: str, body: bytes) -> tuple[str, str]:
+    """Phân loại phản hồi Realtime API -> (kết quả, thông điệp lỗi).
+    'audio' = body là file audio; 'blocked' = gói không mở sync (tắt sync cả tiến trình);
+    'fallback' = lỗi tạm/không rõ, chỉ đoạn này lùi về async. Cố tình KHÔNG raise ở đây: lỗi
+    thật (sai voiceCode, hết credit) sẽ được đường async báo lại với thông điệp rõ ràng."""
+    kind = (content_type or "").split(";")[0].strip().lower()
+    if status_code < 400 and body and (kind.startswith("audio/") or kind == "application/octet-stream"):
+        return "audio", ""
+    message = ""
+    try:
+        data = json.loads(body.decode("utf-8", "ignore")) if body else {}
+    except ValueError:
+        data = {}
+    if isinstance(data, dict):
+        message = vbee_read(data)["error"] or ""
+    if VBEE_SYNC_UNSUPPORTED in message.lower():
+        return "blocked", message
+    return "fallback", message or f"HTTP {status_code}"
 
 
 def vbee_headers() -> dict[str, str]:
@@ -352,46 +555,160 @@ def _vbee_json(resp: Any) -> dict[str, Any]:
 
 
 def _synth_vbee(text: str, output: Path, voice: str | None = None) -> None:
-    """TTS tiếng Việt qua Vbee: POST tạo yêu cầu -> poll tới COMPLETED -> tải audioLink.
-    Mỗi đoạn độc lập nên gọi song song thoải mái (khác VieNeu phải giữ lock)."""
+    """TTS tiếng Việt qua Vbee: ưu tiên Realtime (sync) cho câu ngắn, lùi về Batch (async)
+    khi câu dài/gói không mở sync/sync lỗi. Mỗi đoạn độc lập nên gọi song song thoải mái
+    (khác VieNeu phải giữ lock)."""
     import httpx
 
     if not (settings.vbee_app_id and settings.vbee_token):
         raise PipelineError(
             "Thiếu App ID/token Vbee (đặt VIDEO_DUB_VBEE_APP_ID và VIDEO_DUB_VBEE_TOKEN)."
         )
-    headers = vbee_headers()
-    payload = vbee_request_payload(text, voice or settings.vbee_voice)
+    voice = voice or settings.vbee_voice
     # follow_redirects: audioLink (vbee.vn/s/…) chuyển hướng sang S3 mới ra file thật.
     with httpx.Client(timeout=VBEE_HTTP_TIMEOUT, follow_redirects=True) as client:
-        info = vbee_read(_vbee_json(client.post(VBEE_API_URL, headers=headers, json=payload)))
-        request_id = info["request_id"]
-        if not request_id:
-            raise PipelineError(f"Vbee từ chối tạo giọng: {info['error'] or 'không rõ lỗi'}")
+        if vbee_should_try_sync(text) and _synth_vbee_sync(client, text, output, voice):
+            return
+        _synth_vbee_async(client, text, output, voice)
 
-        deadline = time.monotonic() + VBEE_POLL_TIMEOUT
-        audio_link: str | None = None
-        while True:
-            time.sleep(VBEE_POLL_INTERVAL)
-            info = vbee_read(
-                _vbee_json(client.get(f"{VBEE_API_URL}/requests/{request_id}", headers=headers))
-            )
-            if info["status"] == "COMPLETED" and info["audio_link"]:
-                audio_link = info["audio_link"]
-                break
-            # Response FAILED của Vbee chỉ trả {"error": {...}}, KHÔNG kèm trường status ->
-            # phải coi mọi phản hồi có error là lỗi kết thúc, nếu không sẽ poll tới timeout oan.
-            if info["status"] == "FAILED" or info["error"]:
-                raise PipelineError(f"Vbee tạo giọng thất bại: {info['error'] or 'FAILED'}")
-            if time.monotonic() > deadline:
-                raise PipelineError(
-                    f"Vbee quá thời gian chờ ({VBEE_POLL_TIMEOUT:.0f}s) cho một đoạn TTS."
+
+def _synth_vbee_sync(client: Any, text: str, output: Path, voice: str) -> bool:
+    """Realtime API: POST mode sync -> nhận thẳng bytes audio. True nếu đã ghi được file,
+    False nếu cần lùi về async."""
+    global _vbee_sync_blocked
+
+    try:
+        resp = client.post(
+            VBEE_API_URL,
+            headers=vbee_headers(),
+            json=vbee_sync_payload(text, voice),
+            timeout=VBEE_SYNC_TIMEOUT,
+        )
+    except Exception as exc:  # lỗi mạng/timeout -> để async thử lại, đừng làm hỏng cả job
+        print(f"[vbee] sync lỗi mạng, chuyển sang async: {exc}", file=sys.stderr)
+        return False
+
+    result, message = vbee_sync_outcome(
+        resp.status_code, resp.headers.get("content-type", ""), resp.content
+    )
+    if result == "audio":
+        output.write_bytes(resp.content)
+        return True
+    if result == "blocked":
+        with _vbee_sync_lock:
+            if not _vbee_sync_blocked:
+                _vbee_sync_blocked = True
+                print(
+                    f"[vbee] gói tài khoản chưa mở Realtime ({message}) — dùng async từ đây.",
+                    file=sys.stderr,
                 )
+    else:
+        print(f"[vbee] sync thất bại ({message}), chuyển sang async.", file=sys.stderr)
+    return False
 
-        audio = client.get(audio_link)
-        if audio.status_code >= 400 or not audio.content:
-            raise PipelineError("Không tải được audio Vbee từ audioLink.")
-        output.write_bytes(audio.content)
+
+def _synth_vbee_async(client: Any, text: str, output: Path, voice: str) -> None:
+    """Batch API: POST tạo yêu cầu -> poll tới COMPLETED -> tải audioLink."""
+    headers = vbee_headers()
+    payload = vbee_request_payload(text, voice)
+    info = vbee_read(_vbee_json(client.post(VBEE_API_URL, headers=headers, json=payload)))
+    request_id = info["request_id"]
+    if not request_id:
+        raise PipelineError(f"Vbee từ chối tạo giọng: {info['error'] or 'không rõ lỗi'}")
+
+    deadline = time.monotonic() + VBEE_POLL_TIMEOUT
+    audio_link: str | None = None
+    while True:
+        time.sleep(VBEE_POLL_INTERVAL)
+        info = vbee_read(
+            _vbee_json(client.get(f"{VBEE_API_URL}/requests/{request_id}", headers=headers))
+        )
+        if info["status"] == "COMPLETED" and info["audio_link"]:
+            audio_link = info["audio_link"]
+            break
+        # Response FAILED của Vbee chỉ trả {"error": {...}}, KHÔNG kèm trường status ->
+        # phải coi mọi phản hồi có error là lỗi kết thúc, nếu không sẽ poll tới timeout oan.
+        if info["status"] == "FAILED" or info["error"]:
+            raise PipelineError(f"Vbee tạo giọng thất bại: {info['error'] or 'FAILED'}")
+        if time.monotonic() > deadline:
+            raise PipelineError(
+                f"Vbee quá thời gian chờ ({VBEE_POLL_TIMEOUT:.0f}s) cho một đoạn TTS."
+            )
+
+    audio = client.get(audio_link)
+    if audio.status_code >= 400 or not audio.content:
+        raise PipelineError("Không tải được audio Vbee từ audioLink.")
+    output.write_bytes(audio.content)
+
+
+# --- Danh sách giọng Vbee ---
+VBEE_VOICES_URL = "https://vbee.vn/api/public/v1/voices"
+VBEE_VOICES_TTL = 600.0  # Cache 10 phút: /api/voices bị gọi mỗi lần mở UI.
+VBEE_VOICES_PAGE = 100  # Trần limit của API.
+VBEE_VOICES_MAX_PAGES = 3
+_vbee_voices_cache: dict[str, Any] = {"at": 0.0, "items": []}
+
+
+def parse_vbee_voices(data: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    """Bóc danh sách giọng + cursor trang sau từ phản hồi API voices.
+    Chịu được thân JSON thiếu trường (trả về rỗng thay vì ném lỗi)."""
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    raw = result.get("voices") if isinstance(result.get("voices"), list) else []
+    pagination = result.get("pagination") if isinstance(result.get("pagination"), dict) else {}
+    voices: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict) or not item.get("code"):
+            continue
+        gender = item.get("gender") or ""
+        language = item.get("language_code") or item.get("languageCode") or ""
+        voices.append(
+            {
+                "id": item["code"],
+                "label": item.get("name") or item["code"],
+                "desc": " · ".join(part for part in (gender, language) if part),
+                "gender": gender,
+            }
+        )
+    return voices, pagination.get("next_cursor") or pagination.get("nextCursor") or None
+
+
+def fetch_vbee_voices(language_code: str = "vi-VN", ownership: str = "VBEE") -> list[dict[str, Any]]:
+    """Danh sách giọng Vbee thật (có cache TTL). Mọi lỗi -> trả rỗng để UI vẫn chạy khi
+    thiếu credential/offline/demo mode; nơi gọi tự lùi về giọng cấu hình trong env."""
+    import httpx
+
+    now = time.monotonic()
+    if _vbee_voices_cache["items"] and now - _vbee_voices_cache["at"] < VBEE_VOICES_TTL:
+        return list(_vbee_voices_cache["items"])
+    if not (settings.vbee_app_id and settings.vbee_token):
+        return []
+
+    voices: list[dict[str, Any]] = []
+    try:
+        with httpx.Client(timeout=VBEE_SYNC_TIMEOUT, follow_redirects=True) as client:
+            cursor: str | None = None
+            for _ in range(VBEE_VOICES_MAX_PAGES):
+                params: dict[str, Any] = {
+                    "languageCode": language_code,
+                    "voiceOwnership": ownership,
+                    "limit": VBEE_VOICES_PAGE,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                page, cursor = parse_vbee_voices(
+                    _vbee_json(client.get(VBEE_VOICES_URL, headers=vbee_headers(), params=params))
+                )
+                voices.extend(page)
+                if not cursor or not page:
+                    break
+    except Exception as exc:
+        print(f"[vbee] không lấy được danh sách giọng: {exc}", file=sys.stderr)
+        return []
+
+    if voices:
+        _vbee_voices_cache["items"] = voices
+        _vbee_voices_cache["at"] = now
+    return list(voices)
 
 
 def _is_rate_limited(exc: Exception) -> bool:
@@ -752,12 +1069,15 @@ class Pipeline:
         job = get_job(job_id, include_segments=False)
         if not job or not job["source_path"]:
             raise PipelineError("Không tìm thấy video nguồn.")
+        # Kiểm tra cấu hình giọng ngay từ đầu: sai tên giọng mà để tới bước TTS mới vỡ thì đã
+        # tốn cả STT lẫn tiền dịch.
+        ensure_engine_voices_ready(resolve_tts_engine(job))
         source = Path(job["source_path"])
         work = settings.jobs_dir / job_id
         work.mkdir(parents=True, exist_ok=True)
         metadata = probe(source)
-        if metadata["duration"] > 1800:
-            raise PipelineError("Video vượt giới hạn 30 phút.")
+        if metadata["duration"] > 14400:
+            raise PipelineError("Video vượt giới hạn 4 giờ.")
         update_job(job_id, **metadata, stage="separate", progress=20)
 
         audio = work / "source.wav"
@@ -883,7 +1203,7 @@ class Pipeline:
         # cắt theo cửa sổ âm thanh, đứt giữa câu -> cần mốc từng từ để split_sentences tách
         # đúng ranh giới câu, tránh lồng tiếng bị ngắt quãng giữa một câu.
         segments, _info = model.transcribe(
-            str(vocals), language="en", vad_filter=True, word_timestamps=True
+            str(vocals), language=SOURCE_LANG_CODE, vad_filter=True, word_timestamps=True
         )
         output: list[dict[str, Any]] = []
         for seg in segments:
@@ -914,7 +1234,7 @@ class Pipeline:
         uri = f"gs://{settings.gcs_bucket}/{object_name}"
         config = cloud_speech.RecognitionConfig(
             auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
-            language_codes=["en-US"],
+            language_codes=[SOURCE_LANG_GOOGLE],
             model=settings.stt_model,
             features=cloud_speech.RecognitionFeatures(
                 enable_automatic_punctuation=True,
@@ -971,7 +1291,7 @@ class Pipeline:
 
         transcript = " ".join(item["text"] for item in segments)[:12000]
         prompt = (
-            "Đọc transcript tiếng Anh và soạn NGẮN GỌN bằng tiếng Việt bản HƯỚNG DẪN DỊCH "
+            f"Đọc transcript {SOURCE_LANG_NAME} và soạn NGẮN GỌN bằng tiếng Việt bản HƯỚNG DẪN DỊCH "
             "dùng chung cho mọi phần của video (các phần được dịch song song nên hướng dẫn "
             "phải đủ để giữ nhất quán):\n"
             "- Chủ đề & bối cảnh (1-2 câu).\n"
@@ -1014,12 +1334,12 @@ class Pipeline:
                     "english": item["text"],
                     "max_seconds": round(seconds, 1),
                     "max_chars": max(12, int(seconds * VI_CHARS_PER_SEC)),
-                    "prev_context_en": all_segments[gi - 1]["text"] if gi > 0 else "",
-                    "next_context_en": all_segments[gi + 1]["text"] if gi + 1 < len(all_segments) else "",
+                    "prev_context_src": all_segments[gi - 1]["text"] if gi > 0 else "",
+                    "next_context_src": all_segments[gi + 1]["text"] if gi + 1 < len(all_segments) else "",
                 }
             )
         prompt = (
-            "Bạn là chuyên gia lồng tiếng Anh→Việt. Dịch SÁT NGHĨA, tự nhiên, dễ đọc thành tiếng.\n"
+            f"Bạn là chuyên gia lồng tiếng {SOURCE_LANG_NAME}→Việt. Dịch SÁT NGHĨA, tự nhiên, dễ đọc thành tiếng.\n"
             f"Phong cách: {style}.\n"
             "Quan trọng: mỗi câu dịch phải đọc VỪA trong 'max_seconds' (cố gắng không quá 'max_chars' "
             "ký tự) mà vẫn giữ đủ ý — ưu tiên câu gọn, lược từ đệm thừa thay vì cắt nội dung.\n"
@@ -1241,8 +1561,17 @@ class Pipeline:
         output = settings.jobs_dir / job_id / f"segment-{segment['position']:04d}{suffix}"
         seconds = max(0.5, segment["end"] - segment["start"])
         text = segment["translated_text"]
-        # Lồng tiếng 2 giọng: chọn giọng theo nhãn nam/nữ đã dò; multi tắt -> giọng mặc định.
-        voice = resolve_segment_voice(engine, segment.get("speaker"), bool(job.get("multi_speaker")))
+        # Lồng tiếng 2 giọng: chọn giọng theo nhãn nam/nữ đã dò; multi tắt -> giọng chọn trên UI
+        # (job.voice) hoặc giọng mặc định trong env. VieNeu có danh sách preset offline nên lọc
+        # được giọng lạc engine; Vbee thì không (danh sách phải gọi mạng) -> tin job.voice.
+        known = [voice["id"] for voice in vieneu_preset_voices()] if engine == "vieneu" else None
+        voice = resolve_segment_voice(
+            engine,
+            segment.get("speaker"),
+            bool(job.get("multi_speaker")),
+            job_voice=job.get("voice"),
+            known_voices=known or None,
+        )
 
         # Vòng khớp độ dài: nếu TTS dài hơn khung quá ngưỡng thì viết lại ngắn hơn rồi synth lại.
         # Đo thật + viết lại + atempo lúc render vẫn khống chế được độ dài cho cả hai engine.
@@ -1286,6 +1615,8 @@ class Pipeline:
             output.write_text("Demo mode: cấu hình Google Cloud và FFmpeg để render MP4 thật.", encoding="utf-8")
             update_job(job_id, status="completed", stage="export", progress=100, artifacts={**job["artifacts"], "video": str(output)})
             return output
+        # Job đã duyệt xong mới export -> kiểm tra lại giọng (env có thể đổi từ lúc xử lý).
+        ensure_engine_voices_ready(resolve_tts_engine(job))
         await _stage(job_id, self.hook, "voice", 68, "Đang tạo giọng Việt…")
         pending = [s for s in job["segments"] if s["status"] != "ready" or not s["audio_path"]]
         if pending:
@@ -1317,30 +1648,88 @@ class Pipeline:
         pitch_chain = _pitch_chain(pitch)
         segments = job["segments"]
         bg_seconds = probe_audio(Path(job["artifacts"]["background"]))
-        for index, segment in enumerate(segments):
-            audio_path = Path(segment["audio_path"])
-            # Dùng độ dài đã đo lúc TTS; chỉ probe lại khi thiếu (mp3 tạo bởi bản cũ).
-            duration = float(segment.get("audio_duration") or 0.0)
-            if duration <= 0:
-                duration = probe_audio(audio_path)
-            target = max(0.25, segment["end"] - segment["start"])
-            # Chỗ trống thực tế kéo dài tới lúc câu kế tiếp bắt đầu (hoặc hết nền nếu là
-            # câu cuối): câu hơi dài được tràn sang khoảng lặng thay vì bị tua nhanh.
-            next_start = segments[index + 1]["start"] if index + 1 < len(segments) else bg_seconds
-            avail = next_start - segment["start"] - SPILL_GUARD_SECONDS
-            # Khớp trong khung gốc rồi nhân thêm "speed" để theo kịp timeline đã bị nén lại.
-            # Hai thừa số đã kẹp sẵn (tempo ≤ ATEMPO_MAX, speed trong biên) nên nới lo/hi
-            # để tích của chúng không bị kẹp lần nữa làm lệch đồng bộ.
-            ratio = segment_tempo(duration, target, avail) * speed
-            # Mốc bắt đầu cũng phải chia cho speed để khớp đúng vị trí trên timeline đã tua nhanh.
-            delay = int(segment["start"] / speed * 1000)
-            inputs.extend(["-i", str(audio_path)])
-            label = f"s{index}"
-            filters.append(
-                f"[{index}:a]{AUDIO_FORMAT},{_atempo_chain(ratio, lo=0.5, hi=2.0)},"
-                f"adelay={delay}|{delay}[{label}]"
-            )
-            labels.append(f"[{label}]")
+        
+        if not segments:
+            inputs.extend(["-i", job["source_path"]])
+            if speed_changed:
+                filters.append(f"[0:v]setpts=PTS/{speed:.6f}[vout];[0:a]atempo={speed}[aout]")
+                filter_script = work / "filter-complex.txt"
+                filter_script.write_text(";".join(filters), encoding="utf-8")
+                run([
+                    settings.ffmpeg, "-y", *inputs, "-filter_complex_script", str(filter_script),
+                    "-map", "[vout]", "-c:v", VIDEO_CODEC, "-preset", VIDEO_PRESET, "-crf", VIDEO_CRF, "-pix_fmt", "yuv420p",
+                    "-map", "[aout]", "-c:a", "aac", "-b:a", "192k", str(output)
+                ])
+            else:
+                run([
+                    settings.ffmpeg, "-y", *inputs, "-c:v", "copy", "-c:a", "copy", str(output)
+                ])
+            return output
+            
+        if len(segments) > 30:
+            batch_size = 30
+            for b_idx in range(0, len(segments), batch_size):
+                b_segs = segments[b_idx : b_idx + batch_size]
+                b_inputs: list[str] = []
+                b_filters: list[str] = []
+                b_labels: list[str] = []
+                for i, seg in enumerate(b_segs):
+                    g_idx = b_idx + i
+                    audio_path = Path(seg["audio_path"])
+                    duration = float(seg.get("audio_duration") or 0.0)
+                    if duration <= 0:
+                        duration = probe_audio(audio_path)
+                    target = max(0.25, seg["end"] - seg["start"])
+                    next_start = segments[g_idx + 1]["start"] if g_idx + 1 < len(segments) else bg_seconds
+                    avail = next_start - seg["start"] - SPILL_GUARD_SECONDS
+                    ratio = segment_tempo(duration, target, avail) * speed
+                    delay = int(seg["start"] / speed * 1000)
+                    b_inputs.extend(["-i", str(audio_path)])
+                    label = f"s{i}"
+                    b_filters.append(
+                        f"[{i}:a]{AUDIO_FORMAT},{_atempo_chain(ratio, lo=0.5, hi=2.0)},"
+                        f"adelay={delay}|{delay}[{label}]"
+                    )
+                    b_labels.append(f"[{label}]")
+                b_filters.append(f"{''.join(b_labels)}amix=inputs={len(b_labels)}:normalize=0,{AUDIO_FORMAT}[outa]")
+                b_script = work / f"filter-batch-{b_idx}.txt"
+                b_script.write_text(";".join(b_filters), encoding="utf-8")
+                b_wav = work / f"narration-batch-{b_idx}.wav"
+                run([
+                    settings.ffmpeg, "-y", *b_inputs,
+                    "-filter_complex_script", str(b_script),
+                    "-map", "[outa]", str(b_wav)
+                ])
+                b_input_idx = len(inputs) // 2
+                inputs.extend(["-i", str(b_wav)])
+                label = f"b{b_idx}"
+                filters.append(f"[{b_input_idx}:a]{AUDIO_FORMAT}[{label}]")
+                labels.append(f"[{label}]")
+        else:
+            for index, segment in enumerate(segments):
+                audio_path = Path(segment["audio_path"])
+                # Dùng độ dài đã đo lúc TTS; chỉ probe lại khi thiếu (mp3 tạo bởi bản cũ).
+                duration = float(segment.get("audio_duration") or 0.0)
+                if duration <= 0:
+                    duration = probe_audio(audio_path)
+                target = max(0.25, segment["end"] - segment["start"])
+                # Chỗ trống thực tế kéo dài tới lúc câu kế tiếp bắt đầu (hoặc hết nền nếu là
+                # câu cuối): câu hơi dài được tràn sang khoảng lặng thay vì bị tua nhanh.
+                next_start = segments[index + 1]["start"] if index + 1 < len(segments) else bg_seconds
+                avail = next_start - segment["start"] - SPILL_GUARD_SECONDS
+                # Khớp trong khung gốc rồi nhân thêm "speed" để theo kịp timeline đã bị nén lại.
+                # Hai thừa số đã kẹp sẵn (tempo ≤ ATEMPO_MAX, speed trong biên) nên nới lo/hi
+                # để tích của chúng không bị kẹp lần nữa làm lệch đồng bộ.
+                ratio = segment_tempo(duration, target, avail) * speed
+                # Mốc bắt đầu cũng phải chia cho speed để khớp đúng vị trí trên timeline đã tua nhanh.
+                delay = int(segment["start"] / speed * 1000)
+                inputs.extend(["-i", str(audio_path)])
+                label = f"s{index}"
+                filters.append(
+                    f"[{index}:a]{AUDIO_FORMAT},{_atempo_chain(ratio, lo=0.5, hi=2.0)},"
+                    f"adelay={delay}|{delay}[{label}]"
+                )
+                labels.append(f"[{label}]")
         # Bus thoại: cộng dồn KHÔNG chuẩn-hoá (tránh bug amix chia đôi âm lượng),
         # rồi chuẩn loudness về -16 LUFS và tách 2 nhánh: 1 để nghe, 1 làm khoá sidechain.
         filters.append(
@@ -1349,7 +1738,7 @@ class Pipeline:
             "asplit=2[narr_mix][narr_key0]"
         )
         background = job["artifacts"]["background"]
-        bg_index = len(job["segments"])
+        bg_index = len(inputs) // 2
         source_index = bg_index + 1
         inputs.extend(["-i", background, "-i", job["source_path"]])
         # sidechaincompress cắt output theo độ dài nhánh KHOÁ (sidechain), không phải nhánh

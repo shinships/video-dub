@@ -8,8 +8,12 @@ export function SettingsColumn({ job, health, catalog, busy, onUpdateSettings, o
   const engineId = job.tts_engine || catalog?.default_engine || "vieneu";
   const engines = catalog?.engines || [];
   const engine = engines.find((item) => item.id === engineId);
-  // VieNeu/Vbee mỗi engine chỉ có một giọng cấu hình sẵn (qua env) — hiển thị read-only.
-  const currentVoice = engine?.voices?.[0];
+  const voiceList = engine?.voices || [];
+  // Vbee trả nhiều giọng từ API -> cho chọn; VieNeu (hoặc Vbee khi không gọi được API) chỉ có
+  // một giọng cấu hình qua env -> hiển thị read-only như cũ.
+  const selectableVoices = voiceList.length > 1;
+  const currentVoice =
+    voiceList.find((item) => item.id === job.voice) || voiceList[0];
 
   const processing = job.status === "processing";
   const completed = job.status === "completed" && job.artifacts?.video;
@@ -39,13 +43,30 @@ export function SettingsColumn({ job, health, catalog, busy, onUpdateSettings, o
         </>
       )}
 
-      <label className="field-label">Giọng nói</label>
-      <div className="voice-control">
-        <div>
-          <b>{currentVoice?.label || "Chưa cấu hình"}</b>
-          <small>{currentVoice?.desc || "Đổi giọng qua biến môi trường"}</small>
+      <label className="field-label" htmlFor="voice-select">Giọng nói</label>
+      {selectableVoices ? (
+        <>
+          <select
+            id="voice-select"
+            value={currentVoice?.id || ""}
+            onChange={(event) => onUpdateSettings({ voice: event.target.value })}
+          >
+            {voiceList.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+          <small className="voice-desc">{currentVoice?.desc}</small>
+        </>
+      ) : (
+        <div className="voice-control">
+          <div>
+            <b>{currentVoice?.label || "Chưa cấu hình"}</b>
+            <small>{currentVoice?.desc || "Đổi giọng qua biến môi trường"}</small>
+          </div>
         </div>
-      </div>
+      )}
 
       <h3>Tùy chọn</h3>
       <label className="field-label" htmlFor="style-select">Phong cách</label>
