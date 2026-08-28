@@ -1656,7 +1656,7 @@ class Pipeline:
                 filter_script = work / "filter-complex.txt"
                 filter_script.write_text(";".join(filters), encoding="utf-8")
                 run([
-                    settings.ffmpeg, "-y", *inputs, "-filter_complex_script", str(filter_script),
+                    settings.ffmpeg, "-y", *inputs, "-/filter_complex", str(filter_script),
                     "-map", "[vout]", "-c:v", VIDEO_CODEC, "-preset", VIDEO_PRESET, "-crf", VIDEO_CRF, "-pix_fmt", "yuv420p",
                     "-map", "[aout]", "-c:a", "aac", "-b:a", "192k", str(output)
                 ])
@@ -1697,7 +1697,7 @@ class Pipeline:
                 b_wav = work / f"narration-batch-{b_idx}.wav"
                 run([
                     settings.ffmpeg, "-y", *b_inputs,
-                    "-filter_complex_script", str(b_script),
+                    "-/filter_complex", str(b_script),
                     "-map", "[outa]", str(b_wav)
                 ])
                 b_input_idx = len(inputs) // 2
@@ -1778,7 +1778,7 @@ class Pipeline:
                 settings.ffmpeg,
                 "-y",
                 *inputs,
-                "-filter_complex_script",
+                "-/filter_complex",
                 str(filter_script),
                 *video_args,
                 "-map",

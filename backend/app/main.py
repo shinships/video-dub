@@ -273,11 +273,22 @@ async def retry(job_id: str) -> dict[str, str]:
     return {"status": "queued"}
 
 
+async def _export_with_error_capture(job_id: str) -> None:
+    try:
+        await pipeline.export(job_id)
+    except Exception as exc:  # noqa: BLE001 - phải bắt mọi lỗi để job không kẹt "processing" mãi
+        message = str(exc)
+        stderr = getattr(exc, "stderr", None)
+        if stderr:
+            message = f"{message}\n{stderr[-2000:]}"
+        update_job(job_id, status="error", error=message[:4000])
+
+
 @app.post("/api/jobs/{job_id}/export", status_code=202)
 async def export(job_id: str, tasks: BackgroundTasks) -> dict[str, str]:
     if not get_job(job_id):
         raise HTTPException(404, "Không tìm thấy dự án.")
-    tasks.add_task(pipeline.export, job_id)
+    tasks.add_task(_export_with_error_capture, job_id)
     return {"status": "processing"}
 
 
