@@ -10,3 +10,10 @@ tools/ffmpeg/
 *.pyc
 design-qa-comparison.png
 frontend-preview.png
+
+# local junk
+.DS_Store
+*.log
+logs/
+output/
+*.db
