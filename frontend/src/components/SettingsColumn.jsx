@@ -1,47 +1,37 @@
 import { ArrowRight, DownloadSimple, Gauge, GraphicsCard, SpinnerGap, Waveform } from "@phosphor-icons/react";
 import { API } from "../api.js";
-import { clockShort, money } from "../format.js";
+import { clockShort, money, tokens } from "../format.js";
 
 const STYLES = ["Tự nhiên", "Truyền cảm", "Tài liệu", "Năng động"];
 
 export function SettingsColumn({ job, health, catalog, busy, onUpdateSettings, onExport, onCancel }) {
-  const engineId = job.tts_engine || catalog?.default_engine || "vieneu";
-  const engines = catalog?.engines || [];
-  const engine = engines.find((item) => item.id === engineId);
-  const voiceList = engine?.voices || [];
-  // Vbee trả nhiều giọng từ API -> cho chọn; VieNeu (hoặc Vbee khi không gọi được API) chỉ có
-  // một giọng cấu hình qua env -> hiển thị read-only như cũ.
+  // Chỉ còn một engine TTS (VieNeu local) nên không hiện dropdown chọn engine nữa.
+  const voiceList = catalog?.engines?.[0]?.voices || [];
+  // Đọc được preset VieNeu -> cho chọn; chưa cài vieneu thì backend chỉ trả một giọng từ
+  // env -> hiển thị read-only như cũ.
   const selectableVoices = voiceList.length > 1;
+  const defaultVoiceId =
+    catalog?.engines?.[0]?.default_voice || catalog?.default_voice || "Minh Quân";
   const currentVoice =
-    voiceList.find((item) => item.id === job.voice) || voiceList[0];
+    (job.voice && job.voice !== "Aoede" && voiceList.find((item) => item.id === job.voice)) ||
+    voiceList.find((item) => item.id === defaultVoiceId) ||
+    voiceList[0];
 
   const processing = job.status === "processing";
   const completed = job.status === "completed" && job.artifacts?.video;
   // Ước lượng thô: STT + dịch + TTS + render xấp xỉ 8 lần thời lượng video.
   const estimatedMinutes = Math.max(2, Math.round(((job.duration || 0) / 60) * 8));
+  // Chi phí ĐO THẬT từ token nhà cung cấp trả về (jobs.cost), không phải số ước lượng cứng.
+  // `vnd` null nghĩa là model không có trong bảng giá -> thà không hiện còn hơn hiện số bịa.
+  const total = job.cost?.total || { input_tokens: 0, output_tokens: 0, calls: 0 };
+  const measured = typeof job.cost?.vnd === "number" && total.calls > 0;
+  const costModel = job.cost?.model && job.cost.model !== "(demo)" ? job.cost.model : "";
 
   return (
     <aside className="settings-column">
       <h2>
         <Waveform /> Giọng & phong cách
       </h2>
-
-      {engines.length > 0 && (
-        <>
-          <label className="field-label" htmlFor="engine-select">Engine TTS</label>
-          <select
-            id="engine-select"
-            value={engineId}
-            onChange={(event) => onUpdateSettings({ tts_engine: event.target.value })}
-          >
-            {engines.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.label}
-              </option>
-            ))}
-          </select>
-        </>
-      )}
 
       <label className="field-label" htmlFor="voice-select">Giọng nói</label>
       {selectableVoices ? (
@@ -116,7 +106,7 @@ export function SettingsColumn({ job, health, catalog, busy, onUpdateSettings, o
           <span>
             <GraphicsCard /> GPU
           </span>
-          <b>{health.gpu?.name || "Không phát hiện"}</b>
+          <b>{health?.gpu?.name || "Không phát hiện"}</b>
         </div>
         <div>
           <span>Số câu</span>
@@ -131,23 +121,35 @@ export function SettingsColumn({ job, health, catalog, busy, onUpdateSettings, o
           <b>Tiếng Việt</b>
         </div>
         <hr />
-        <h3 className="cost-title">Ước tính chi phí</h3>
+        <h3 className="cost-title">Chi phí API</h3>
         <div>
-          <span>STT (nhận dạng giọng nói)</span>
-          <span>{money(job.cost?.stt)}</span>
+          <span>Nhận dạng giọng nói (Whisper)</span>
+          <span className="free">Miễn phí · local</span>
         </div>
         <div>
-          <span>Dịch thuật</span>
-          <span>{money(job.cost?.translation)}</span>
+          <span>Tách nhạc nền (Demucs)</span>
+          <span className="free">Miễn phí · local</span>
         </div>
         <div>
-          <span>TTS (tổng hợp giọng nói)</span>
-          <span>{money(job.cost?.tts)}</span>
+          <span>Tạo giọng (VieNeu)</span>
+          <span className="free">Miễn phí · local</span>
         </div>
+        <div>
+          <span>Dịch{costModel ? ` (${costModel})` : ""}</span>
+          <span>{measured ? money(job.cost.vnd) : "—"}</span>
+        </div>
+        {measured && (
+          <div className="cost-tokens">
+            <span>Token đã dùng</span>
+            <span>
+              {tokens(total.input_tokens)} vào · {tokens(total.output_tokens)} ra · {total.calls} lời gọi
+            </span>
+          </div>
+        )}
         <hr />
         <div className="total">
-          <b>Tổng cộng (ước tính)</b>
-          <strong>{money(job.cost?.total)}</strong>
+          <b>Tổng cộng{measured ? " (đo thật)" : ""}</b>
+          <strong>{measured ? money(job.cost.vnd) : "chưa có"}</strong>
         </div>
       </section>
 

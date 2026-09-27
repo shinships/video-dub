@@ -1,6 +1,6 @@
 import { SpinnerGap, UploadSimple } from "@phosphor-icons/react";
 
-export function UploadModal({ busy, multiSpeaker, onToggleMultiSpeaker, onUpload, onClose }) {
+export function UploadModal({ busy, limitLabel, multiSpeaker, onToggleMultiSpeaker, onUpload, onClose }) {
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section
@@ -17,7 +17,7 @@ export function UploadModal({ busy, multiSpeaker, onToggleMultiSpeaker, onUpload
         </span>
         <h2>Tải video tiếng Anh</h2>
         <p>
-          MP4, MKV hoặc MOV · tối đa 30 phút
+          MP4, MKV hoặc MOV · tối đa {limitLabel || "4 giờ"}
           <br />
           Có thể kéo-thả video vào đây
         </p>

@@ -44,7 +44,7 @@ def init_db() -> None:
                 duration REAL NOT NULL DEFAULT 0,
                 width INTEGER NOT NULL DEFAULT 0,
                 height INTEGER NOT NULL DEFAULT 0,
-                voice TEXT NOT NULL DEFAULT 'Aoede',
+                voice TEXT NOT NULL DEFAULT 'Minh Quân',
                 style TEXT NOT NULL DEFAULT 'Tự nhiên',
                 tts_engine TEXT,
                 multi_speaker INTEGER NOT NULL DEFAULT 0,
@@ -154,3 +154,10 @@ def update_segment(segment_id: str, **fields: Any) -> None:
             f"UPDATE segments SET {columns} WHERE id = ?",
             (*fields.values(), segment_id),
         )
+
+
+def delete_job(job_id: str) -> bool:
+    """Xoá job khỏi DB. Segments tự đi theo nhờ ON DELETE CASCADE (PRAGMA foreign_keys đã
+    bật trong connect()). Trả False khi không có job nào bị xoá."""
+    with connect() as conn:
+        return conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,)).rowcount > 0

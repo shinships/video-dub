@@ -8,9 +8,8 @@ from typing import Any
 
 from .config import settings
 from .db import connect, get_job, now_iso
-from .pipeline import DEFAULT_JOB_SPEED, PipelineError, probe
+from .pipeline import DEFAULT_JOB_SPEED, PipelineError, check_duration, probe
 
-MAX_DURATION_SECONDS = 14400  # 240 phút (4 giờ)
 
 
 def is_url(source: str) -> bool:
@@ -25,12 +24,25 @@ def download_source(url: str, dest_dir: Path) -> Path:
         raise PipelineError("Cần cài yt-dlp để tải video từ URL (pip install yt-dlp).") from exc
 
     dest_dir.mkdir(parents=True, exist_ok=True)
+    node_bin = shutil.which("node")
+    if not node_bin:
+        for candidate in (
+            "/Users/mktmda/aicoworker/app/nodejs/bin/node",
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+        ):
+            if Path(candidate).is_file():
+                node_bin = candidate
+                break
+
     options = {
         "outtmpl": str(dest_dir / "%(id)s.%(ext)s"),
         "format": "mp4/bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "quiet": True,
         "noprogress": True,
+        # YouTube cần JS runtime để tạo PO token, không có sẽ bị 403
+        "js_runtimes": {"node": {"path": node_bin}} if node_bin else {"node": {}},
     }
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -58,8 +70,7 @@ def prepare_source(source: str, job_id: str, copy: bool = True) -> tuple[Path, s
 
 def probe_and_check(path: Path) -> dict[str, Any]:
     metadata = probe(path)
-    if metadata["duration"] > MAX_DURATION_SECONDS:
-        raise PipelineError("Video vượt giới hạn 30 phút.")
+    check_duration(metadata["duration"])
     return metadata
 
 
@@ -102,7 +113,7 @@ def register_job(
 
 def create_job_from_source(
     source: str,
-    voice: str = "Aoede",
+    voice: str = "Minh Quân",
     style: str = "Tự nhiên",
     job_id: str | None = None,
     copy: bool = True,
@@ -110,6 +121,8 @@ def create_job_from_source(
     """Tiện ích một bước cho CLI: chuẩn bị nguồn → probe → đăng ký job.
     Idempotent: nếu --job-id trỏ tới job đã tồn tại (vd retry sau lỗi), trả về job đó
     nguyên trạng thay vì insert trùng (sẽ vi phạm UNIQUE constraint trên jobs.id)."""
+    if not voice or voice == "Aoede":
+        voice = getattr(settings, "vieneu_voice", None) or "Minh Quân"
     if job_id:
         existing = get_job(job_id, include_segments=False)
         if existing:
@@ -121,8 +134,12 @@ def create_job_from_source(
 
 
 def default_output_path(source: str, name: str) -> Path:
-    """Nơi xuất mặc định: cạnh video gốc (file local) hoặc thư mục hiện tại (URL)."""
+    """Nơi xuất mặc định: thư mục output_dir (nếu cấu hình), cạnh video gốc (file local) hoặc thư mục hiện tại (URL)."""
     stem = Path(name).stem
+    if getattr(settings, "output_dir", None):
+        out_dir = Path(settings.output_dir).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / f"{stem}.vi.mp4"
     if is_url(source):
         return Path.cwd() / f"{stem}.vi.mp4"
     return Path(source).resolve().with_name(f"{stem}.vi.mp4")

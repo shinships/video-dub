@@ -63,3 +63,15 @@ def test_apply_review_only_changed_and_existing_ids():
     applied = tool.apply_review(edits, current, lambda sid, vi: calls.append((sid, vi)))
     assert applied == 1
     assert calls == [("a", "mới")]
+
+
+def test_parse_args_supports_resume(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_video_dub_job.py", "--resume", "--job-id", "test-job-123"])
+    args = tool.parse_args()
+    assert args.resume is True
+    assert args.job_id == "test-job-123"
+
+    monkeypatch.setattr(sys, "argv", ["run_video_dub_job.py", "--source", "video.mp4"])
+    args_normal = tool.parse_args()
+    assert args_normal.resume is False
+    assert args_normal.source == "video.mp4"

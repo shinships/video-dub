@@ -23,13 +23,11 @@ thân app "Lồng Tiếng AI" — không hoạt động nếu chỉ mở UI mà 
 
 | Muốn gì | Field | Giá trị hợp lệ | Ghi chú |
 |---|---|---|---|
-| Đổi engine TTS cho **một job cụ thể** mà không đổi cấu hình chung | `tts_engine` trên job (qua `PATCH /api/jobs/{id}`) | `"gemini"` \| `"vieneu"` \| `"vbee"` \| bỏ trống (dùng mặc định toàn cục `VIDEO_DUB_TTS_ENGINE`) | Cho phép nhiều job chạy song song với engine khác nhau — vd job A dùng VieNeu (local, miễn phí), job B dùng Gemini (cloud), job C dùng Vbee (cloud VN). Xem [pipeline.py `resolve_tts_engine`](backend/app/pipeline.py). |
+| _(hiện chưa có)_ | — | — | Tuỳ chọn đổi engine TTS theo job đã bị gỡ cùng với Vbee: nay chỉ còn VieNeu chạy local nên không còn gì để chọn. |
 
-Ví dụ yêu cầu trong chat:
-
-> "Cho job vừa upload dùng VieNeu thay vì Gemini."
->
-> "Video ABC.mp4 dịch xong rồi, đổi sang giọng cloud cho job đó vì VieNeu đọc sai vài từ tiếng Anh xen kẽ."
+Trước đây mục này dùng để đổi `tts_engine` cho từng job (VieNeu / Vbee). Vbee đã gỡ khỏi dự
+án, `resolve_tts_engine` luôn trả `"vieneu"`, và field `tts_engine` cũng không còn trong
+`PATCH /api/jobs/{id}`. Khi có tuỳ chọn backend-only mới, thêm lại vào bảng trên.
 
 ## Khi nào nên "thăng cấp" lên UI thật
 

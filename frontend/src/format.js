@@ -16,3 +16,7 @@ export const clockShort = (seconds = 0) => {
 // Ngân sách ký tự để bản dịch đọc vừa khung thời gian (~13 ký tự tiếng Việt/giây).
 export const charBudget = (segment) =>
   Math.max(60, Math.round((segment.end - segment.start) * 13));
+
+// Token gọn cho bảng chi phí: 55.200 -> "55,2K".
+export const tokens = (value = 0) =>
+  value >= 1000 ? `${(value / 1000).toFixed(1).replace(".", ",")}K` : String(value);

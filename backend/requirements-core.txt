@@ -4,3 +4,6 @@ python-multipart==0.0.20
 pydantic==2.11.7
 httpx==0.28.1
 pytest==8.4.1
+# Lưu API key vào keychain của HĐH (Keychain trên macOS, Credential Manager trên Windows)
+# thay vì ghi ra .env — xem SettingsStore trong app/config.py.
+keyring==25.6.0

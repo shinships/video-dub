@@ -20,19 +20,14 @@ from app.pipeline import (
     classify_gender,
     resolve_segment_voice,
     resolve_tts_engine,
+    TTS_ENGINE,
     segment_audio_suffix,
     segment_median_f0,
     segment_tempo,
     split_sentences,
     ensure_engine_voices_ready,
-    parse_vbee_voices,
     parse_vieneu_voices,
     unknown_vieneu_voices,
-    vbee_read,
-    vbee_request_payload,
-    vbee_should_try_sync,
-    vbee_sync_outcome,
-    vbee_sync_payload,
     vieneu_infer_kwargs,
 )
 
@@ -128,10 +123,10 @@ def _make_segments(count: int) -> list[dict]:
 def test_translate_retries_missing_indices(monkeypatch):
     pipe = Pipeline(hook=None)
     monkeypatch.setattr(pipe, "_genai_client", lambda: object())
-    monkeypatch.setattr(pipe, "_build_context", lambda client, segs: "ngữ cảnh")
+    monkeypatch.setattr(pipe, "_build_context", lambda client, segs, meter=None: "ngữ cảnh")
     calls: list[list[int]] = []
 
-    def fake_chunk(client, indices, all_segments, style, context):
+    def fake_chunk(client, indices, all_segments, style, context, meter=None):
         calls.append(list(indices))
         if len(calls) == 1:
             return {0: "không", 2: "hai"}  # bỏ sót index 1
@@ -314,9 +309,6 @@ def test_assign_speakers_empty():
 def _voice_cfg():
     # Cfg giả lập giống Settings cho resolve_segment_voice (dataclass thật là frozen).
     return SimpleNamespace(
-        vbee_voice="v_default",
-        vbee_voice_male="v_male",
-        vbee_voice_female="v_female",
         vieneu_voice="vn_default",
         vieneu_ref_audio="",
         vieneu_voice_male="vn_male",
@@ -326,25 +318,6 @@ def _voice_cfg():
     )
 
 
-def test_resolve_segment_voice_vbee_by_gender():
-    cfg = _voice_cfg()
-    assert resolve_segment_voice("vbee", "female", True, cfg) == "v_female"
-    assert resolve_segment_voice("vbee", "male", True, cfg) == "v_male"
-    # Multi tắt -> giọng mặc định 1-giọng như cũ, bất kể nhãn.
-    assert resolve_segment_voice("vbee", "female", False, cfg) == "v_default"
-    assert resolve_segment_voice("vbee", None, True, cfg) == "v_default"
-
-
-def test_resolve_segment_voice_vbee_prefers_job_voice():
-    # Giọng chọn trên UI (jobs.voice) thắng env ở chế độ 1-giọng...
-    cfg = _voice_cfg()
-    assert resolve_segment_voice("vbee", None, False, cfg, job_voice="sg_male_x") == "sg_male_x"
-    # ...nhưng "Aoede" (giọng Vertex AI, mặc định cũ của cột jobs.voice) không phải voiceCode Vbee.
-    assert resolve_segment_voice("vbee", None, False, cfg, job_voice="Aoede") == "v_default"
-    assert resolve_segment_voice("vbee", None, False, cfg, job_voice="") == "v_default"
-    assert resolve_segment_voice("vbee", None, False, cfg, job_voice=None) == "v_default"
-    # Lồng tiếng 2 giọng: giọng nam/nữ theo env vẫn thắng lựa chọn trên UI.
-    assert resolve_segment_voice("vbee", "female", True, cfg, job_voice="sg_male_x") == "v_female"
 
 
 def test_resolve_segment_voice_vieneu_prefers_job_voice_over_ref_audio():
@@ -419,8 +392,8 @@ def test_ensure_engine_voices_ready_raises_only_for_bad_vieneu_config(monkeypatc
     with pytest.raises(pipeline_module.PipelineError) as err:
         ensure_engine_voices_ready("vieneu")
     assert "Sai Tên" in str(err.value) and "Đức Trí" in str(err.value)
-    # Vbee không kiểm tra offline được -> không chặn.
-    ensure_engine_voices_ready("vbee")
+    # Engine lạ (dữ liệu cũ) không kiểm tra offline được -> không chặn.
+    ensure_engine_voices_ready("khong-ton-tai")
 
 
 def test_resolve_segment_voice_vieneu_by_gender():
@@ -434,10 +407,8 @@ def test_resolve_segment_voice_vieneu_by_gender():
 def test_resolve_segment_voice_falls_back_when_gender_unset():
     # Giọng nữ chưa cấu hình -> fallback về mặc định thay vì trả rỗng/hỏng.
     cfg = _voice_cfg()
-    cfg.vbee_voice_female = ""
     cfg.vieneu_voice_female = ""
     cfg.vieneu_ref_audio_female = ""
-    assert resolve_segment_voice("vbee", "female", True, cfg) == "v_default"
     assert resolve_segment_voice("vieneu", "female", True, cfg) == {"voice": "vn_default"}
 
 
@@ -469,16 +440,16 @@ def test_translate_applies_review_fixes(monkeypatch):
     # Sau khi dịch, pass soát lại được gọi và bản sửa của nó ghi đè đúng index.
     pipe = Pipeline(hook=None)
     monkeypatch.setattr(pipe, "_genai_client", lambda: object())
-    monkeypatch.setattr(pipe, "_build_context", lambda client, segs: "ngữ cảnh")
+    monkeypatch.setattr(pipe, "_build_context", lambda client, segs, meter=None: "ngữ cảnh")
     monkeypatch.setattr(
         pipe,
         "_translate_chunk",
-        lambda client, indices, all_segments, style, context: {i: f"vi{i}" for i in indices},
+        lambda client, indices, all_segments, style, context, meter=None: {i: f"vi{i}" for i in indices},
     )
     monkeypatch.setattr(
         pipe,
         "_review_translations",
-        lambda client, segments, translated, context: {1: "vi1-đã-sửa"},
+        lambda client, segments, translated, context, meter=None: {1: "vi1-đã-sửa"},
     )
     translated, _context = pipe._translate(_make_segments(3), "tự nhiên")
     assert [item["translated"] for item in translated] == ["vi0", "vi1-đã-sửa", "vi2"]
@@ -493,10 +464,10 @@ def test_review_translations_skips_without_context():
 def test_translate_falls_back_to_english_when_retry_fails(monkeypatch):
     pipe = Pipeline(hook=None)
     monkeypatch.setattr(pipe, "_genai_client", lambda: object())
-    monkeypatch.setattr(pipe, "_build_context", lambda client, segs: "")
+    monkeypatch.setattr(pipe, "_build_context", lambda client, segs, meter=None: "")
     calls: list[list[int]] = []
 
-    def fake_chunk(client, indices, all_segments, style, context):
+    def fake_chunk(client, indices, all_segments, style, context, meter=None):
         calls.append(list(indices))
         if len(calls) == 1:
             return {0: "không"}
@@ -521,106 +492,16 @@ def test_is_rate_limited_detects_429_variants():
     assert not _is_rate_limited(Exception("403 PermissionDenied: API disabled"))
 
 
-def test_segment_audio_suffix_follows_tts_engine():
-    assert segment_audio_suffix("vieneu") == ".wav"
-    # Vbee trả MP3 -> dùng chung nhánh mặc định.
-    assert segment_audio_suffix("vbee") == ".mp3"
+def test_segment_audio_suffix_is_wav():
+    # VieNeu save ra WAV; engine cũ trong DB cũng phải ra WAV vì đã bị ép về VieNeu.
+    assert segment_audio_suffix() == ".wav"
+    assert segment_audio_suffix("vbee") == ".wav"
 
 
-def test_vbee_request_payload_uses_async_mode():
-    # Đường Batch: mode async, có webhookUrl bắt buộc dù ta chỉ poll.
-    payload = vbee_request_payload("Xin chào", "hn_female_ngochuyen_full_48k-fhg")
-    assert payload["mode"] == "async"
-    assert payload["text"] == "Xin chào"
-    assert payload["voiceCode"] == "hn_female_ngochuyen_full_48k-fhg"
-    assert payload["outputFormat"] == "mp3"
-    assert payload["webhookUrl"]
 
 
-def test_vbee_read_handles_post_poll_and_error_shapes():
-    # POST trả requestId + PROCESSING (chưa có audio).
-    post = vbee_read({"requestId": "abc", "status": "PROCESSING"})
-    assert post == {"request_id": "abc", "status": "PROCESSING", "audio_link": None, "error": None}
-    # GET tới COMPLETED kèm audioLink; status chuẩn hoá in hoa.
-    done = vbee_read({"requestId": "abc", "status": "completed", "audioLink": "https://x/y"})
-    assert done["status"] == "COMPLETED" and done["audio_link"] == "https://x/y"
-    # Bọc trong "result" (như API voices) vẫn bóc được.
-    wrapped = vbee_read({"result": {"requestId": "z", "status": "PROCESSING"}})
-    assert wrapped["request_id"] == "z"
-    # Lỗi -> lấy message, không có request_id.
-    err = vbee_read({"error": {"code": "BAD_REQUEST", "message": "thiếu webhookUrl"}})
-    assert err["request_id"] is None and err["error"] == "thiếu webhookUrl"
 
 
-def test_vbee_sync_payload_has_no_webhook():
-    # Realtime API trả thẳng audio -> không requestId/webhookUrl như đường Batch.
-    payload = vbee_sync_payload("Xin chào", "hn_female_ngochuyen_full_48k-fhg")
-    assert payload["mode"] == "sync"
-    assert payload["voiceCode"] == "hn_female_ngochuyen_full_48k-fhg"
-    assert payload["outputFormat"] == "mp3"
-    assert "webhookUrl" not in payload
-
-
-def test_vbee_should_try_sync_respects_limit_mode_and_block():
-    short = "Xin chào các bạn"
-    long_text = "a" * (pipeline_module.VBEE_SYNC_MAX_CHARS + 1)
-    assert vbee_should_try_sync(short, mode="auto", blocked=False)
-    # Trần 300 ký tự áp cả khi ép sync — câu dài buộc đi Batch.
-    assert not vbee_should_try_sync(long_text, mode="sync", blocked=False)
-    assert not vbee_should_try_sync(short, mode="async", blocked=False)
-    # Đã biết gói không mở sync -> không thử lại ở các đoạn sau.
-    assert not vbee_should_try_sync(short, mode="auto", blocked=True)
-
-
-def test_vbee_sync_outcome_classifies_audio_blocked_and_fallback():
-    assert vbee_sync_outcome(200, "audio/mpeg", b"ID3data") == ("audio", "")
-    # Body rỗng dù status 200 -> không ghi file rỗng, lùi về async.
-    assert vbee_sync_outcome(200, "audio/mpeg", b"")[0] == "fallback"
-    blocked = vbee_sync_outcome(
-        400,
-        "application/json",
-        json.dumps(
-            {"error": {"code": "BAD_REQUEST", "message": "This feature is not supported in user package"}}
-        ).encode(),
-    )
-    assert blocked[0] == "blocked" and "user package" in blocked[1]
-    # Vượt giới hạn đồng thời -> chỉ đoạn này lùi về async, không tắt sync cả tiến trình.
-    busy = vbee_sync_outcome(
-        429,
-        "application/json",
-        json.dumps({"error": {"code": "TTS_CCR_MAX_LIMIT_REACHED", "message": "quá tải"}}).encode(),
-    )
-    assert busy == ("fallback", "quá tải")
-    # Thân không phải JSON hợp lệ vẫn phải ra fallback kèm mã HTTP.
-    assert vbee_sync_outcome(500, "text/html", b"<html>")[0] == "fallback"
-
-
-def test_parse_vbee_voices_reads_codes_and_cursor():
-    voices, cursor = parse_vbee_voices(
-        {
-            "result": {
-                "voices": [
-                    {
-                        "code": "hn_female_ngochuyen_full_48k-fhg",
-                        "name": "HN - Ngọc Huyền",
-                        "gender": "female",
-                        "language_code": "vi-VN",
-                    },
-                    {"name": "thiếu code"},
-                ],
-                "pagination": {"next_cursor": "abc", "has_next_page": True},
-            }
-        }
-    )
-    assert cursor == "abc"
-    # Bản ghi thiếu code bị bỏ (không dùng làm voiceCode được).
-    assert len(voices) == 1
-    assert voices[0]["id"] == "hn_female_ngochuyen_full_48k-fhg"
-    assert voices[0]["label"] == "HN - Ngọc Huyền"
-    assert voices[0]["gender"] == "female"
-    assert "female" in voices[0]["desc"]
-    # Thân JSON lạ/rỗng -> rỗng chứ không ném lỗi (UI vẫn chạy).
-    assert parse_vbee_voices({}) == ([], None)
 
 
 def test_vieneu_infer_kwargs_prefers_ref_audio_over_preset():
@@ -630,13 +511,13 @@ def test_vieneu_infer_kwargs_prefers_ref_audio_over_preset():
     assert vieneu_infer_kwargs("", "") == {}
 
 
-def test_resolve_tts_engine_prefers_job_over_global(monkeypatch):
-    # Job đặt riêng engine (qua PATCH /api/jobs, không qua UI) phải thắng cấu hình toàn cục.
-    # settings là dataclass frozen -> patch nguyên tên "settings" trong module thay vì field.
-    monkeypatch.setattr(pipeline_module, "settings", SimpleNamespace(tts_engine="vbee"))
-    assert resolve_tts_engine({"tts_engine": "vieneu"}) == "vieneu"
-    assert resolve_tts_engine({"tts_engine": None}) == "vbee"
-    assert resolve_tts_engine({}) == "vbee"
+def test_resolve_tts_engine_coerces_legacy_engines_to_vieneu():
+    # Vbee đã gỡ nhưng job cũ trong DB vẫn còn tts_engine='vbee' và user không sửa được cột
+    # đó từ UI nữa -> phải ép về VieNeu, không để job hỏng ở bước TTS.
+    assert TTS_ENGINE == "vieneu"
+    assert resolve_tts_engine({"tts_engine": "vbee"}) == "vieneu"
+    assert resolve_tts_engine({"tts_engine": None}) == "vieneu"
+    assert resolve_tts_engine({}) == "vieneu"
 
 
 def test_default_job_speed_stays_within_atempo_range():
@@ -677,3 +558,516 @@ def test_write_srt_defaults_to_speed_one(tmp_path, monkeypatch):
     pipe = Pipeline(hook=None)
     content = pipe._write_srt("job-y").read_text(encoding="utf-8")
     assert "00:00:01,000 --> 00:00:03,000" in content
+
+
+def test_settings_gemini_api_keys():
+    from backend.app.config import Settings
+
+    s1 = Settings(gemini_api_key="key1")
+    assert s1.gemini_api_keys == ["key1"]
+
+    s2 = Settings(gemini_api_key="key1, key2; key3\nkey4")
+    assert s2.gemini_api_keys == ["key1", "key2", "key3", "key4"]
+
+    s3 = Settings(gemini_api_key=' "keyA", "keyB" ')
+    assert s3.gemini_api_keys == ["keyA", "keyB"]
+
+    s4 = Settings(gemini_api_key="")
+    assert s4.gemini_api_keys == []
+
+
+def test_multikey_genai_client_round_robin():
+    from backend.app.pipeline import _MultiKeyGenaiClient
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, key):
+            self.key = key
+            self.models = self
+
+        def generate_content(self, *args, **kwargs):
+            calls.append(self.key)
+            return f"result_from_{self.key}"
+
+    client = _MultiKeyGenaiClient(["key1", "key2"], client_factory=FakeClient)
+    r1 = client.models.generate_content("prompt1")
+    r2 = client.models.generate_content("prompt2")
+    r3 = client.models.generate_content("prompt3")
+
+    assert r1 == "result_from_key1"
+    assert r2 == "result_from_key2"
+    assert r3 == "result_from_key1"
+    assert calls == ["key1", "key2", "key1"]
+
+
+def test_multikey_genai_client_failover_on_rate_limit():
+    from backend.app.pipeline import _MultiKeyGenaiClient
+
+    class FakeRateLimitError(Exception):
+        pass
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, key):
+            self.key = key
+            self.models = self
+
+        def generate_content(self, *args, **kwargs):
+            calls.append(self.key)
+            if self.key == "key1":
+                raise FakeRateLimitError("429 RESOURCE_EXHAUSTED")
+            return "success_from_key2"
+
+    client = _MultiKeyGenaiClient(["key1", "key2"], client_factory=FakeClient)
+    result = client.models.generate_content("prompt")
+    assert result == "success_from_key2"
+    assert calls == ["key1", "key2"]
+
+
+def test_multikey_genai_client_raises_when_all_fail():
+    import pytest
+    from backend.app.pipeline import _MultiKeyGenaiClient
+
+    class FakeRateLimitError(Exception):
+        pass
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, key):
+            self.key = key
+            self.models = self
+
+        def generate_content(self, *args, **kwargs):
+            calls.append(self.key)
+            raise FakeRateLimitError("429 RESOURCE_EXHAUSTED")
+
+    client = _MultiKeyGenaiClient(["key1", "key2"], client_factory=FakeClient)
+    with pytest.raises(FakeRateLimitError):
+        client.models.generate_content("prompt")
+    assert calls == ["key1", "key2"]
+
+
+def test_multikey_genai_client_does_not_rotate_on_non_rate_limit_error():
+    import pytest
+    from backend.app.pipeline import _MultiKeyGenaiClient
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, key):
+            self.key = key
+            self.models = self
+
+        def generate_content(self, *args, **kwargs):
+            calls.append(self.key)
+            raise ValueError("bad argument")
+
+    client = _MultiKeyGenaiClient(["key1", "key2"], client_factory=FakeClient)
+    with pytest.raises(ValueError, match="bad argument"):
+        client.models.generate_content("prompt")
+    assert calls == ["key1"]
+
+
+def test_settings_deepseek_config():
+    from backend.app.config import Settings
+
+    s1 = Settings(deepseek_api_key="ds-key1, ds-key2", translate_engine="deepseek")
+    assert s1.deepseek_api_keys == ["ds-key1", "ds-key2"]
+    assert s1.effective_translate_engine == "deepseek"
+    assert s1.active_translate_model == "deepseek-v4-pro"
+    assert s1.cloud_ready is True
+
+    s2 = Settings(deepseek_api_key="ds-key1", gemini_api_key="", translate_engine="auto")
+    assert s2.effective_translate_engine == "deepseek"
+
+    s3 = Settings(deepseek_api_key="", gemini_api_key="gem-key", translate_engine="auto")
+    assert s3.effective_translate_engine == "gemini"
+    assert s3.active_translate_model == "gemini-3.8-flash"
+
+
+def test_openai_compat_engine_and_payload_omit_deepseek_reasoning():
+    from types import SimpleNamespace
+    from backend.app.config import Settings
+    from backend.app.pipeline import _MultiKeyDeepSeekClient
+
+    settings = Settings(
+        translate_engine="openai_compat",
+        openai_compat_api_key="proxy-key",
+        openai_compat_model="video-dub-gemini-flash",
+        openai_compat_base_url="http://127.0.0.1:23334/v1",
+    )
+    assert settings.effective_translate_engine == "openai_compat"
+    assert settings.active_translate_model == "video-dub-gemini-flash"
+    assert not any(item["key"] == "translator_key" for item in settings.missing_requirements)
+
+    captured = {}
+    class FakeHttpClient:
+        def post(self, url, headers, json, timeout):
+            captured.update(url=url, headers=headers, payload=json)
+            return SimpleNamespace(status_code=200, json=lambda: {"choices": [{"message": {"content": "OK"}}]}, text="")
+
+    client = _MultiKeyDeepSeekClient(
+        api_keys=["proxy-key"], base_url=settings.openai_compat_base_url,
+        model=settings.openai_compat_model, http_client=FakeHttpClient(),
+        supports_reasoning_effort=False,
+    )
+    client.models.generate_content("hello", config=SimpleNamespace(temperature=0.2, thinking_config=SimpleNamespace(thinking_budget=0)))
+    assert captured["url"] == "http://127.0.0.1:23334/v1/chat/completions"
+    assert "reasoning_effort" not in captured["payload"]
+
+
+def test_multikey_deepseek_client_round_robin():
+    from types import SimpleNamespace
+    from backend.app.pipeline import _MultiKeyDeepSeekClient
+
+    calls = []
+
+    class FakeHttpClient:
+        def post(self, url, headers, json, timeout):
+            key = headers["Authorization"].replace("Bearer ", "")
+            calls.append(key)
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"choices": [{"message": {"content": f"translated_by_{key}"}}]},
+                text="",
+            )
+
+    client = _MultiKeyDeepSeekClient(
+        api_keys=["ds-1", "ds-2"],
+        model="deepseek-v4-pro",
+        http_client=FakeHttpClient(),
+    )
+    r1 = client.models.generate_content("hello")
+    r2 = client.models.generate_content("world")
+    r3 = client.models.generate_content("again")
+
+    assert r1.text == "translated_by_ds-1"
+    assert r2.text == "translated_by_ds-2"
+    assert r3.text == "translated_by_ds-1"
+    assert calls == ["ds-1", "ds-2", "ds-1"]
+
+
+def test_multikey_deepseek_client_failover_on_429():
+    from types import SimpleNamespace
+    from backend.app.pipeline import _MultiKeyDeepSeekClient
+
+    calls = []
+
+    class FakeHttpClient:
+        def post(self, url, headers, json, timeout):
+            key = headers["Authorization"].replace("Bearer ", "")
+            calls.append(key)
+            if key == "ds-1":
+                return SimpleNamespace(
+                    status_code=429,
+                    text="429 RateLimit/QuotaExceeded",
+                )
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"choices": [{"message": {"content": "ok_from_ds-2"}}]},
+                text="",
+            )
+
+    client = _MultiKeyDeepSeekClient(
+        api_keys=["ds-1", "ds-2"],
+        model="deepseek-v4-pro",
+        http_client=FakeHttpClient(),
+    )
+    resp = client.models.generate_content("test prompt")
+    assert resp.text == "ok_from_ds-2"
+    assert calls == ["ds-1", "ds-2"]
+
+
+def test_pipeline_selects_deepseek_client(monkeypatch):
+    from types import SimpleNamespace
+    from backend.app import pipeline as pipeline_module
+    from backend.app.pipeline import Pipeline, _MultiKeyDeepSeekClient
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "settings",
+        SimpleNamespace(
+            effective_translate_engine="deepseek",
+            deepseek_api_keys=["ds-test-key"],
+            deepseek_model="deepseek-v4-pro",
+            deepseek_base_url="https://api.deepseek.com/chat/completions",
+        ),
+    )
+    pipe = Pipeline(hook=None)
+    client = pipe._translation_client()
+    assert isinstance(client, _MultiKeyDeepSeekClient)
+
+
+
+def test_missing_config_no_longer_silently_enables_demo_mode():
+    """Demo mode chỉ bật khi người dùng chủ động yêu cầu.
+
+    Bản cũ: `effective_demo_mode = demo_mode or not (cloud_ready and ffmpeg and ffprobe)`
+    -> thiếu bất cứ thứ gì cũng trả kết quả giả mà không báo lỗi.
+    """
+    from backend.app.config import Settings
+
+    broken = Settings(gemini_api_key="", deepseek_api_key="", google_project="")
+    assert broken.effective_demo_mode is False
+    assert broken.cloud_ready is False
+    assert [item["key"] for item in broken.missing_requirements] == ["translator_key"]
+
+    assert Settings(demo_mode=True).effective_demo_mode is True
+
+
+def test_missing_requirements_flags_google_stt_without_bucket():
+    from backend.app.config import Settings
+
+    keys = [
+        item["key"]
+        for item in Settings(gemini_api_key="k", stt_engine="google", gcs_bucket="").missing_requirements
+    ]
+    assert keys == ["google_stt"]
+    # Whisper chạy local nên không cần bucket.
+    assert Settings(gemini_api_key="k", stt_engine="whisper").missing_requirements == []
+
+
+def test_cleanup_job_intermediates_keeps_what_reexport_needs(tmp_path, monkeypatch):
+    """Dọn rác nhưng phải giữ nền + giọng từng câu, nếu không sửa một câu là phải chạy lại
+    tách nền và TTS toàn bộ video."""
+    from backend.app import pipeline as pipe
+
+    work = tmp_path / "jobs" / "job1"
+    (work / "demucs" / "htdemucs" / "source").mkdir(parents=True)
+    stem = work / "demucs" / "htdemucs" / "source"
+
+    rac = {
+        work / "narration-batch-0.wav": 1000,
+        work / "narration-batch-30.wav": 2000,
+        work / "filter-batch-0.txt": 10,
+        work / "filter-complex.txt": 10,
+        work / "source.wav": 500,
+        stem / "vocals.wav": 300,
+    }
+    giu = [work / "dubbed-vi.mp4", work / "subtitles-vi.srt", work / "segment-0001.wav", stem / "no_vocals.wav"]
+    for path, size in rac.items():
+        path.write_bytes(b"x" * size)
+    for path in giu:
+        path.write_bytes(b"k")
+
+    monkeypatch.setattr(pipe, "settings", SimpleNamespace(jobs_dir=tmp_path / "jobs"))
+
+    freed = pipe.cleanup_job_intermediates("job1")
+    assert freed == sum(rac.values())
+    assert not any(path.exists() for path in rac)
+    assert all(path.exists() for path in giu), "đã xoá nhầm file cần cho lần export sau"
+
+    # Job không tồn tại -> không nổ.
+    assert pipe.cleanup_job_intermediates("khong-co") == 0
+
+
+def test_delete_job_files_removes_everything(tmp_path, monkeypatch):
+    from backend.app import pipeline as pipe
+
+    jobs = tmp_path / "jobs"
+    uploads = tmp_path / "uploads"
+    (jobs / "job1" / "demucs").mkdir(parents=True)
+    uploads.mkdir()
+    (jobs / "job1" / "dubbed-vi.mp4").write_bytes(b"x" * 70)
+    (jobs / "job1" / "demucs" / "no_vocals.wav").write_bytes(b"y" * 30)
+    (uploads / "job1.mp4").write_bytes(b"z" * 40)
+    (uploads / "job2.mp4").write_bytes(b"w" * 999)  # job khác, KHÔNG được đụng
+
+    monkeypatch.setattr(pipe, "settings", SimpleNamespace(jobs_dir=jobs, uploads_dir=uploads))
+    assert pipe.delete_job_files("job1") == 140
+    assert not (jobs / "job1").exists()
+    assert not (uploads / "job1.mp4").exists()
+    assert (uploads / "job2.mp4").exists()
+
+
+def test_read_response_usage_handles_both_provider_shapes():
+    """Gemini báo `usage_metadata`, DeepSeek báo `usage` kiểu OpenAI. Cả hai đều tính
+    prompt ĐÃ GỒM token cache -> phải trừ ra, không thì tính tiền cache theo giá full."""
+    from backend.app.pipeline import read_response_usage
+
+    gemini = SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=1000, candidates_token_count=200, cached_content_token_count=400
+        )
+    )
+    usage = read_response_usage(gemini)
+    assert (usage.input_tokens, usage.cached_input_tokens, usage.output_tokens) == (600, 400, 200)
+
+    deepseek = SimpleNamespace(
+        usage={"prompt_tokens": 1000, "completion_tokens": 200, "prompt_cache_hit_tokens": 400}
+    )
+    assert read_response_usage(deepseek) == usage
+
+    # Response không mang thông tin token -> None (để meter vẫn đếm được số lời gọi).
+    assert read_response_usage(SimpleNamespace(text="xin chào")) is None
+
+
+def test_estimate_usd_prices_cache_cheaper_and_skips_unknown_models():
+    from backend.app.pipeline import TokenUsage, estimate_usd
+
+    usage = TokenUsage(input_tokens=600, cached_input_tokens=400, output_tokens=200)
+    # 600*0.75 + 400*0.075 + 200*3.75, chia 1 triệu.
+    assert estimate_usd(usage, "gemini-3.8-flash") == pytest.approx(0.00123)
+    # Cache rẻ hơn hẳn: dồn hết sang cache thì rẻ đi nhiều lần.
+    cached_only = TokenUsage(cached_input_tokens=1000)
+    full_price = TokenUsage(input_tokens=1000)
+    assert estimate_usd(cached_only, "gemini-3.8-flash") < estimate_usd(full_price, "gemini-3.8-flash") / 9
+    # Model lạ -> không bịa ra giá.
+    assert estimate_usd(usage, "model-nao-do") is None
+
+
+def test_usage_meter_accumulates_per_stage_and_is_thread_safe():
+    from concurrent.futures import ThreadPoolExecutor
+    from backend.app.pipeline import UsageMeter
+
+    meter = UsageMeter(model="gemini-3.8-flash")
+    response = SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=100, candidates_token_count=10, cached_content_token_count=0
+        )
+    )
+    # Các lô dịch chạy song song -> cộng dồn phải an toàn với nhiều luồng.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _: meter.record("translate", response), range(200)))
+    meter.record("review", response)
+
+    snap = meter.snapshot()
+    assert snap["stages"]["translate"] == {
+        "input_tokens": 20000,
+        "cached_input_tokens": 0,
+        "output_tokens": 2000,
+        "calls": 200,
+    }
+    assert snap["total"]["calls"] == 201
+    assert snap["vnd"] > 0 and snap["model"] == "gemini-3.8-flash"
+
+
+def test_merge_cost_adds_up_across_phases_instead_of_overwriting():
+    """Job dịch một lần rồi có thể export NHIỀU lần (mỗi lần viết-lại câu đều gọi LLM).
+    Ghi đè sẽ làm mất phần đã tiêu trước đó = tính thiếu tiền."""
+    from backend.app.pipeline import merge_cost
+
+    phase1 = {
+        "model": "gemini-3.8-flash",
+        "stages": {"translate": {"input_tokens": 1000, "output_tokens": 500, "calls": 3}},
+    }
+    phase2 = {
+        "model": "gemini-3.8-flash",
+        "stages": {
+            "translate": {"input_tokens": 200, "output_tokens": 100, "calls": 1},
+            "rewrite": {"input_tokens": 50, "output_tokens": 20, "calls": 2},
+        },
+    }
+    merged = merge_cost(phase1, phase2)
+    assert merged["stages"]["translate"]["input_tokens"] == 1200
+    assert merged["stages"]["translate"]["calls"] == 4
+    assert merged["stages"]["rewrite"]["calls"] == 2
+    assert merged["total"] == {
+        "input_tokens": 1250,
+        "cached_input_tokens": 0,
+        "output_tokens": 620,
+        "calls": 6,
+    }
+    assert merged["vnd"] > 0
+
+    # Chưa có gì trước đó / dữ liệu cũ sai định dạng -> không nổ.
+    assert merge_cost(None, phase2)["stages"]["rewrite"]["calls"] == 2
+    assert merge_cost({"stt": 1680, "total": 12180}, phase2)["total"]["calls"] == 3
+
+
+def test_read_response_usage_counts_thinking_tokens_as_output():
+    """thoughts_token_count nằm NGOÀI candidates_token_count nhưng vẫn bị tính giá output.
+    Pipeline đã tắt thinking ở cả 4 call site, nhưng model vẫn có thể trả thoughts (nhánh lùi
+    khi không hỗ trợ thinking_budget=0) — bỏ qua trường này là tính thiếu tiền."""
+    from backend.app.pipeline import read_response_usage
+
+    usage = read_response_usage(
+        SimpleNamespace(
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=500,
+                candidates_token_count=100,
+                cached_content_token_count=0,
+                thoughts_token_count=800,
+            )
+        )
+    )
+    assert usage.output_tokens == 900
+    assert usage.input_tokens == 500
+
+
+def test_deepseek_reasoning_payload_forwards_thinking_budget_zero():
+    """Pipeline tắt thinking qua thinking_config (cú pháp google-genai); client DeepSeek
+    trước đây chỉ đọc temperature nên yêu cầu đó bị đánh rơi và mỗi lời gọi vẫn trả tiền cho
+    reasoning. Đo A/B trên API thật: 89 -> 22 token completion."""
+    from backend.app.pipeline import deepseek_reasoning_payload
+
+    off = SimpleNamespace(temperature=0.2, thinking_config=SimpleNamespace(thinking_budget=0))
+    assert deepseek_reasoning_payload(off) == {"reasoning_effort": "none"}
+
+    # Không khai báo thinking_config -> giữ nguyên hành vi mặc định của model.
+    assert deepseek_reasoning_payload(SimpleNamespace(temperature=0.3)) == {}
+    assert deepseek_reasoning_payload(None) == {}
+    # Có ngân sách thinking > 0 -> tôn trọng, không tự ý tắt.
+    assert deepseek_reasoning_payload(SimpleNamespace(thinking_config=SimpleNamespace(thinking_budget=512))) == {}
+
+
+def test_generate_without_thinking_turns_thinking_off_and_keeps_config():
+    """Bốn lời gọi LLM đều là bám chỉ dẫn, không phải suy luận nhiều bước, mà thinking token
+    bị tính GIÁ OUTPUT. Trước đây _build_context và _rewrite_shorter bỏ sót: sau khi sửa lỗi
+    DeepSeek, riêng _build_context đã chiếm 1.763/1.843 token output của cả job."""
+    from backend.app.pipeline import generate_without_thinking
+
+    seen = []
+
+    class _Models:
+        def generate_content(self, *, model, contents, config):
+            seen.append(config)
+            return SimpleNamespace(text="ok")
+
+    client = SimpleNamespace(models=_Models())
+    generate_without_thinking(client, "prompt", temperature=0.3)
+
+    assert len(seen) == 1
+    assert seen[0].thinking_config.thinking_budget == 0
+    assert seen[0].temperature == 0.3  # config của call site không bị helper nuốt mất
+
+
+def test_generate_without_thinking_falls_back_when_model_rejects_it():
+    """Model không hỗ trợ thinking_budget=0 thì phải chạy được với config mặc định, chứ không
+    làm hỏng cả bước dịch."""
+    from backend.app.pipeline import generate_without_thinking
+
+    seen = []
+
+    class _Models:
+        def generate_content(self, *, model, contents, config):
+            seen.append(config)
+            if getattr(config, "thinking_config", None) is not None:
+                raise RuntimeError("400 INVALID_ARGUMENT: thinking_budget not supported")
+            return SimpleNamespace(text="ok")
+
+    client = SimpleNamespace(models=_Models())
+    assert generate_without_thinking(client, "prompt", temperature=0.2).text == "ok"
+
+    assert len(seen) == 2  # thử tắt thinking -> bị từ chối -> chạy lại không có thinking_config
+    assert getattr(seen[1], "thinking_config", None) is None
+    assert seen[1].temperature == 0.2
+
+
+def test_generate_without_thinking_reraises_other_errors_for_backoff():
+    """Lỗi quota/mạng phải nổi lên cho _with_backoff xử lý, không được nuốt thành lời gọi thứ hai."""
+    from backend.app.pipeline import generate_without_thinking
+
+    calls = []
+
+    class _Models:
+        def generate_content(self, *, model, contents, config):
+            calls.append(config)
+            raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+    with pytest.raises(RuntimeError, match="429"):
+        generate_without_thinking(SimpleNamespace(models=_Models()), "prompt", temperature=0.2)
+    assert len(calls) == 1

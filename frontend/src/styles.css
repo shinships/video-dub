@@ -171,3 +171,44 @@ button { color: inherit; }
   .stepper { padding-left: 18%; padding-right: 18%; }
   .table-head, .segment-row { grid-template-columns: 22px 68px 1fr 1.2fr 90px 68px; gap: 8px; }
 }
+
+/* Màn hình thay workspace khi chưa có dự án / thiếu cấu hình / backend chưa bật. */
+.blank-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 40px 24px; text-align: center; color: var(--muted); }
+.blank-state svg { color: var(--accent); }
+.blank-state h2 { margin: 0; font-family: Manrope, system-ui, sans-serif; font-size: 20px; color: var(--ink); }
+.blank-state p { margin: 0; font-size: 13px; max-width: 460px; line-height: 1.6; }
+.blank-state .primary-action { width: auto; margin-top: 8px; padding: 0 26px; }
+.blank-missing { margin: 0; padding: 14px 18px 14px 34px; text-align: left; list-style: disc; background: var(--soft); border: 1px solid var(--line); border-radius: 6px; font-size: 13px; color: var(--ink); line-height: 1.7; max-width: 520px; }
+.blank-code, .blank-state code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 2px 7px; color: var(--ink); }
+.blank-hint { font-size: 12px; }
+.estimate .free { color: var(--green); font-weight: 600; }
+.estimate .cost-tokens span:last-child { color: var(--muted); font-size: 11px; }
+
+.header-settings { width: 38px; height: 38px; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 7px; background: white; display: grid; place-items: center; cursor: pointer; color: #5d6270; }
+.header-settings:hover { border-color: var(--accent); color: var(--accent); }
+
+.settings-dialog { width: 560px; max-height: 84vh; display: flex; flex-direction: column; background: #fffdf9; border-radius: 14px; box-shadow: 0 24px 80px rgba(31,35,48,.23); }
+.settings-dialog header { padding: 24px 28px 14px; border-bottom: 1px solid var(--line); }
+.settings-dialog header h2 { margin: 0; font: 700 21px Manrope, sans-serif; }
+.settings-dialog header p { margin: 6px 0 0; font-size: 11px; color: var(--muted); }
+.settings-body { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 28px; }
+.settings-loading { padding: 28px; text-align: center; color: var(--muted); font-size: 12px; }
+.settings-dialog fieldset { border: 0; border-top: 1px solid var(--line); margin: 0 0 18px; padding: 14px 0 0; }
+.settings-dialog fieldset:first-of-type { border-top: 0; padding-top: 0; }
+.settings-dialog legend { padding: 0 8px 0 0; font: 700 12px Manrope, sans-serif; color: var(--accent); }
+.settings-row { display: grid; grid-template-columns: 200px 1fr; align-items: center; gap: 10px 14px; margin-bottom: 12px; }
+.settings-label { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; }
+.settings-label svg { color: var(--amber); flex: 0 0 auto; }
+.settings-label em { font-style: normal; font-size: 10px; font-weight: 500; color: var(--muted); }
+.settings-row input[type="text"], .settings-row input[type="password"], .settings-row select { height: 36px; border: 1px solid var(--line); border-radius: 6px; background: white; padding: 0 10px; font-size: 12px; color: var(--ink); width: 100%; }
+.settings-row input:focus, .settings-row select:focus { outline: 2px solid var(--accent-light); border-color: var(--accent); }
+.settings-row input[type="checkbox"] { justify-self: start; width: 16px; height: 16px; accent-color: var(--accent); }
+.settings-row small { grid-column: 2; margin-top: -4px; font-size: 10px; color: var(--muted); line-height: 1.5; }
+.settings-missing { display: flex; gap: 10px; padding: 12px 14px; margin-bottom: 16px; border: 1px solid #f2c3be; border-radius: 8px; background: #fdecea; color: #7c221c; }
+.settings-missing svg { flex: 0 0 auto; font-size: 20px; }
+.settings-missing ul { margin: 0; padding-left: 16px; font-size: 11px; line-height: 1.7; }
+.settings-warn { padding: 10px 14px; margin-bottom: 16px; border: 1px solid #f0d9a4; border-radius: 8px; background: #fdf6e6; color: #7a5b12; font-size: 11px; line-height: 1.6; }
+.settings-error { margin: 0; padding: 10px 28px; color: var(--danger); font-size: 11px; }
+.settings-dialog footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; padding: 14px 28px 20px; border-top: 1px solid var(--line); }
+.settings-dialog footer .text-button { margin-top: 0; }
+.settings-dialog footer .primary-action { width: auto; height: 42px; padding: 0 22px; }

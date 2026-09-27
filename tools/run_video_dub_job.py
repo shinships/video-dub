@@ -37,12 +37,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lồng tiếng Việt cho một video.")
     parser.add_argument("--source", default=os.getenv("VIDEO_DUB_SOURCE"), help="File local hoặc URL.")
     parser.add_argument("--job-id", default=os.getenv("VIDEO_DUB_JOB_ID") or str(uuid.uuid4()))
-    parser.add_argument("--voice", default=os.getenv("VIDEO_DUB_VOICE", "Aoede"))
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Khôi phục/chạy tiếp job đã có (nhảy thẳng tới áp bản duyệt/export, bỏ qua STT/dịch).",
+    )
+    parser.add_argument(
+        "--voice",
+        default=os.getenv("VIDEO_DUB_VIENEU_VOICE", os.getenv("VIDEO_DUB_VOICE", "Minh Quân")),
+    )
     parser.add_argument(
         "--tts-engine",
-        choices=["vieneu", "vbee"],
+        choices=["vieneu"],
         default=os.getenv("VIDEO_DUB_JOB_TTS_ENGINE"),
-        help="Ghi đè engine TTS riêng cho job này (mặc định: dùng VIDEO_DUB_TTS_ENGINE toàn cục).",
+        help="Engine TTS. Chỉ còn 'vieneu' (Vbee đã gỡ); giữ cờ để script cũ không vỡ.",
     )
     parser.add_argument(
         "--multi-speaker",
@@ -51,6 +59,7 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("VIDEO_DUB_MULTI_SPEAKER", "false").lower() in {"1", "true", "yes"},
         help="Lồng tiếng 2 giọng: tự dò nam/nữ theo đoạn rồi gán giọng riêng.",
     )
+    parser.add_argument("--tag", default=os.getenv("VIDEO_DUB_TAG"), help="Hashtag tuỳ chỉnh thêm vào caption Telegram.")
     parser.add_argument("--speed", type=float, default=None, help="Toc do video output, vi du 1.1.")
     parser.add_argument("--style", default=os.getenv("VIDEO_DUB_STYLE", "Tự nhiên"))
     parser.add_argument("--output", default=os.getenv("VIDEO_DUB_OUTPUT"), help="Nơi lưu MP4 kết quả.")
@@ -58,7 +67,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--silent-background", action="store_true", help="Xuat chi TTS, khong giu audio goc.")
     parser.add_argument("--skip-separation", action="store_true", help="Nhan dang truc tiep tu audio nguon.")
     parser.add_argument("--allow-long", action="store_true", help="Cho phep CLI xu ly video vuot gioi han web 30 phut.")
-    parser.add_argument("--resume", action="store_true", help="Bo qua STT/dich; nap job co san (--job-id) va export tiep.")
+    parser.add_argument(
+        "--translate-engine",
+        choices=["gemini", "deepseek", "openai_compat"],
+        default=os.getenv("VIDEO_DUB_TRANSLATE_ENGINE"),
+        help="Ghi đè engine dịch riêng cho job này (gemini | deepseek | openai_compat).",
+    )
+    parser.add_argument(
+        "--translate-model",
+        default=None,
+        help="Ghi đè model dịch (vd deepseek-v4-pro, gemini-3.8-flash).",
+    )
     parser.add_argument("--review-out", default=None, help="Dung sau buoc dich, xuat bang duyet ra file JSON (khong export).")
     parser.add_argument("--review-in", default=None, help="Nap file duyet da sua (JSON) va ap vao ban dich truoc khi export.")
     return parser.parse_args()
@@ -172,6 +191,14 @@ async def main() -> None:
 
     init_db()
 
+    if args.translate_engine:
+        os.environ["VIDEO_DUB_TRANSLATE_ENGINE"] = args.translate_engine
+    if args.translate_model:
+        if args.translate_engine == "deepseek" or "deepseek" in args.translate_model.lower():
+            os.environ["VIDEO_DUB_DEEPSEEK_MODEL"] = args.translate_model
+        else:
+            os.environ["VIDEO_DUB_GEMINI_MODEL"] = args.translate_model
+
     async def hook(current_job_id: str, event: dict) -> None:
         emit({"job_id": current_job_id, "event": event})
 
@@ -217,11 +244,39 @@ async def main() -> None:
                 output = Path(args.output)
             elif original_source:
                 output = service.default_output_path(original_source, current_job["name"])
-            else:  # Job cũ chưa lưu original_source: đành xuất cạnh thư mục hiện tại.
-                output = Path.cwd() / f"{Path(current_job['name']).stem}.vi.mp4"
+            else:  # Job cũ chưa lưu original_source: vẫn tôn trọng output_dir toàn cục.
+                configured = getattr(settings, "output_dir", "")
+                output = (
+                    Path(configured).expanduser() / f"{Path(current_job['name']).stem}.vi.mp4"
+                    if configured
+                    else Path.cwd() / f"{Path(current_job['name']).stem}.vi.mp4"
+                )
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(produced, output)
             result["output"] = str(output)
+
+            # Một điểm delivery duy nhất: watcher và Telegram bot đều gọi CLI này, nên mọi
+            # luồng hoàn tất đều được gửi giống nhau. Lưu message_id vào artifacts để --resume
+            # hoặc retry không upload trùng.
+            artifacts = (get_job(job_id, include_segments=False) or {}).get("artifacts") or {}
+            skip_telegram = os.getenv("VIDEO_DUB_SKIP_TELEGRAM_DELIVERY", "").lower() in {"1", "true", "yes"}
+            if not artifacts.get("telegram_delivery") and not skip_telegram:
+                try:
+                    from telegram_delivery import send_completed_video
+
+                    delivery = await asyncio.to_thread(
+                        send_completed_video,
+                        output,
+                        f"✅ Lồng tiếng xong: {output.name}",
+                    )
+                    if not delivery.get("skipped"):
+                        update_job(job_id, artifacts={**artifacts, "telegram_delivery": delivery})
+                        result["telegram_delivery"] = delivery
+                except Exception as exc:
+                    # File local là nguồn chân lý; Telegram lỗi không được biến job đã render
+                    # thành failed hay làm mất thành phẩm.
+                    result["telegram_error"] = str(exc)
+                    print(f"[telegram-delivery] {exc}", file=sys.stderr, flush=True)
         else:
             result["note"] = "Chưa có MP4 thật (có thể đang demo mode — cấu hình FFmpeg + Cloud)."
         emit(result)
@@ -340,6 +395,8 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+        # Giải phóng tiến trình lập tức, tránh lỗi libc++ abort (-6) khi C-extension (torch/onnx) huỷ static threads trên macOS
+        os._exit(0)
     except Exception:
         trace = traceback.format_exc()
         print(trace, file=sys.stderr, flush=True)

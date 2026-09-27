@@ -1,6 +1,7 @@
 # Lồng Tiếng AI
 
-Web app local để dịch và lồng tiếng Việt cho video tiếng Anh dưới 30 phút.
+Web app local để dịch và lồng tiếng Việt cho video tiếng Anh (mặc định tối đa 4 giờ,
+đổi được trong Cài đặt).
 
 ## Có gì trong MVP
 
@@ -8,10 +9,10 @@ Web app local để dịch và lồng tiếng Việt cho video tiếng Anh dư�
 - Queue xử lý tuần tự, SSE cập nhật tiến trình, cancel/retry.
 - Demucs tách thoại khỏi nhạc; ưu tiên CUDA, tự fallback CPU. Tuỳ chọn `htdemucs_ft`.
 - STT: faster-whisper chạy local (mặc định, không cần GCS) hoặc Google STT V2 batch.
-- Gemini 2.5 Flash dịch theo lô có ngữ cảnh + glossary, khống chế độ dài để khớp giọng.
+- Gemini/DeepSeek dịch theo lô có ngữ cảnh + glossary, khống chế độ dài để khớp giọng.
 - Timeline editor, lưu và regenerate riêng từng đoạn; tốc độ/cao độ chỉnh được.
-- TTS giọng Việt: VieNeu-TTS chạy local (mặc định, miễn phí, hỗ trợ nhân bản giọng)
-  hoặc Vbee (cloud VN, giọng tự nhiên); vòng viết-lại để TTS đọc vừa khung giờ.
+- TTS giọng Việt: VieNeu-TTS chạy **100% local** (miễn phí, hỗ trợ nhân bản giọng);
+  vòng viết-lại để TTS đọc vừa khung giờ.
 - Lồng tiếng 2 giọng (tùy chọn): tự dò nam/nữ theo cao độ rồi gán giọng riêng cho mỗi vai.
 - FFmpeg: ducking động giữ nguyên nhạc nền gốc, chuẩn loudness bus thoại −16 LUFS,
   TTS tạo song song, xuất MP4 + SRT.
@@ -28,6 +29,31 @@ Yêu cầu: Python 3.11+, pnpm/Node.js.
 
 Mở [http://127.0.0.1:5173](http://127.0.0.1:5173). API docs ở
 [http://127.0.0.1:8010/docs](http://127.0.0.1:8010/docs).
+
+## Cài đặt trong app (không cần sửa .env)
+
+Bấm biểu tượng bánh răng trên thanh trên cùng để mở **Cài đặt**: API key dịch, engine dịch,
+giọng VieNeu (kể cả file wav 3-5 giây để nhân bản giọng), engine STT, model Whisper/Demucs,
+thiết bị chạy TTS.
+
+- Thay đổi **có hiệu lực ngay**, không phải khởi động lại backend.
+- **API key được lưu vào keychain của hệ điều hành** (Keychain trên macOS, Credential Manager
+  trên Windows), không ghi ra `.env`, và không bao giờ được API trả ngược ra ngoài.
+- Thứ tự ưu tiên: keychain → `settings.json` trong thư mục dữ liệu → `.env` → mặc định. Giá
+  trị bấm lưu trong app thắng `.env`; ô nào đang lấy từ `.env` thì Cài đặt có ghi chú ngay cạnh.
+- Máy không có keychain thì việc lưu key báo lỗi rõ ràng chứ **không** âm thầm ghi ra file thường.
+
+## Khoá API cục bộ
+
+Backend chỉ bind `127.0.0.1` và **mọi route đều cần token**, vì app giữ API key và credit của
+bạn — để cổng 8010 mở cho mọi tiến trình trên máy là đủ để một script bất kỳ đọc hoặc sửa cấu
+hình. (CORS không chặn được `curl`; nó chỉ ràng buộc trình duyệt.)
+
+- Token tự sinh lần chạy đầu, lưu ở `data/api-token` với quyền `0600`, giữ nguyên qua các lần
+  khởi động. Đặt `VIDEO_DUB_API_TOKEN` để tự chỉ định.
+- `pnpm dev` **không cần cấu hình gì**: dev server proxy `/api` sang uvicorn và tự gắn token,
+  nên token không bao giờ có mặt trong JS của trình duyệt.
+- Gọi bằng tay: `curl -H "X-Video-Dub-Token: $(cat data/api-token)" http://127.0.0.1:8010/api/health`
 
 ## Bật pipeline Google Cloud thật
 
@@ -75,16 +101,22 @@ VIDEO_DUB_VIENEU_REF_AUDIO=
 ONNX Runtime, không cần torch; có GPU thì `pip install "vieneu[gpu]"`), miễn phí và
 không dính quota. Đây là engine TTS **mặc định**. Bước dịch vẫn dùng Gemini qua Vertex AI.
 
-Bản v3turbo (mode mặc định của SDK) có sẵn **10 giọng preset**, đọc thẳng từ
-`vieneu/assets/voices_v3_turbo.json` nên UI liệt kê được mà không phải nạp model:
+Bản v3turbo (mode mặc định của SDK, `vieneu>=3.6.0`) có sẵn **23 giọng preset** đủ vùng miền (Bắc / Trung / Nam) và phong cách (tin tức, kể chuyện, tự nhiên...), đọc thẳng từ `vieneu/assets/voices_v3_turbo.json` nên UI liệt kê được mà không phải nạp model:
 
-| Giọng | | Giọng | |
+| Giọng | Đặc trưng | Giọng | Đặc trưng |
 |---|---|---|---|
-| Ngọc Lan | nữ, dịu dàng | Trúc Ly | nữ, trẻ trung |
-| Mỹ Duyên | nữ, mượt mà | Ngọc Linh | nữ, tươi sáng |
-| Gia Bảo | nam, mượt mà | Xuân Vĩnh | nam, vui tươi |
-| Thái Sơn | nam, chắc khỏe | Trọng Hữu | nam, uyên bác |
-| Đức Trí | nam, rõ ràng | Bình An | nam, điềm đạm |
+| Adam | Nam · Nam · Tự nhiên (mặc định) | Trúc Ly | Nữ · Bắc · Tự nhiên |
+| Minh Đức | Nam · Bắc · Tin tức | Mai Anh | Nữ · Bắc · Tin tức |
+| Phạm Tuyên | Nam · Bắc · Tự nhiên | Ngọc Linh | Nữ · Bắc · Kể chuyện |
+| Thái Sơn | Nam · Nam · Kể chuyện | Đoan Trang | Nữ · Bắc · Tự nhiên |
+| Xuân Vĩnh | Nam · Bắc · Tự nhiên | Thục Đoan | Nữ · Nam · Kể chuyện |
+| Thanh Bình | Nam · Bắc · Kể chuyện | Thùy Dung | Nữ · Nam · Tin tức |
+| Minh Triết | Nam · Nam · Tin tức | Ngọc Trân | Nữ · Trung · Tự nhiên |
+| Quang Sơn | Nam · Trung · Tự nhiên | Mỹ Duyên | Nữ · Nam · Đọc truyện |
+| Đức Trí | Nam · Nam · Đọc truyện | Quỳnh Anh | Nữ · Bắc · Đọc truyện |
+| Mạnh Dũng | Nam · Bắc · Tự nhiên | Kim Thanh | Nữ · Nam · Đọc truyện |
+| Minh Quân | Nam · Bắc · Tự nhiên | Ngọc Huyền | Nữ · Bắc · Tự nhiên |
+| Anh Khôi | Nam · Bắc · Kể chuyện | | |
 
 Chọn giọng trên dropdown "Giọng nói" (lưu vào `jobs.voice`, thắng cấu hình env cho job đó),
 hoặc đặt mặc định qua `VIDEO_DUB_VIENEU_VOICE`, hoặc nhân bản giọng riêng qua
@@ -92,35 +124,8 @@ hoặc đặt mặc định qua `VIDEO_DUB_VIENEU_VOICE`, hoặc nhân bản gi�
 backend báo lỗi ngay khi **bắt đầu xử lý** job và log cảnh báo lúc khởi động — không để tới
 bước tạo giọng mới vỡ sau khi đã tốn STT + tiền dịch.
 
-Muốn đổi engine cho **một job cụ thể** (không đổi cấu hình chung) mà không có nút trên
-UI? Xem [AI-CHAT.md](AI-CHAT.md) — yêu cầu trực tiếp trong chat với Claude Code.
-
-## TTS bằng Vbee (cloud VN, giọng tiếng Việt tự nhiên)
-
-Không cần cài thêm gì (dùng `httpx` sẵn có). Lấy **App ID** và **token** trong studio
-Vbee rồi đặt trong `.env`:
-
-```
-VIDEO_DUB_TTS_ENGINE=vbee
-VIDEO_DUB_VBEE_APP_ID=<app-id>
-VIDEO_DUB_VBEE_TOKEN=<token>
-# voiceCode mặc định; danh sách giọng hiện ngay trên UI (lấy từ API voices của Vbee)
-VIDEO_DUB_VBEE_VOICE=hn_female_ngochuyen_full_48k-fhg
-# auto (mặc định) | sync | async — xem bên dưới
-VIDEO_DUB_VBEE_MODE=auto
-```
-
-Bước tạo giọng đi **Realtime API** (`mode: sync`, trả thẳng MP3 trong ~1s) cho đoạn ≤ 300 ký
-tự, và **tự lùi về Batch API** (`mode: async`: POST → poll `COMPLETED` → tải MP3) khi đoạn dài
-hơn, khi sync lỗi, hoặc khi gói tài khoản chưa mở Realtime (Vbee trả *"not supported in user
-package"* — lúc đó cả tiến trình chuyển hẳn sang async, chỉ báo một lần). Ép một đường cố định
-bằng `VIDEO_DUB_VBEE_MODE=sync|async`.
-
-Giọng: dropdown "Giọng nói" trong cột cài đặt liệt kê giọng Vbee thật (gọi
-`GET https://vbee.vn/api/public/v1/voices`, cache 10 phút); chọn giọng nào thì job lưu vào
-`jobs.voice` và dùng đúng giọng đó khi export. Không gọi được API (thiếu credential/offline)
-thì UI lùi về đúng giọng trong `VIDEO_DUB_VBEE_VOICE`. Khi bật lồng tiếng 2 giọng, giọng
-nam/nữ theo env vẫn thắng lựa chọn trên UI. Bước dịch vẫn dùng Gemini qua Vertex AI.
+Đây là engine TTS duy nhất: bước tạo giọng chạy hoàn toàn trên máy bạn, không gọi cloud và
+không tốn tiền API. Chỉ bước **dịch** mới gọi Gemini/DeepSeek.
 
 ## Lồng tiếng 2 giọng (nam/nữ)
 
@@ -137,8 +142,6 @@ Cấu hình giọng cho mỗi giới tính (giọng **nam** để trống thì k
 nên thường chỉ cần khai thêm giọng **nữ**):
 
 ```
-# Vbee: chỉ cần thêm 1 voiceCode nữ bên cạnh giọng nam đang dùng.
-VIDEO_DUB_VBEE_VOICE_FEMALE=hn_female_ngochuyen_full_48k-fhg
 # VieNeu: preset hoặc file wav 3-5s để nhân bản, cho từng giới tính.
 VIDEO_DUB_VIENEU_REF_AUDIO_MALE=<male.wav>
 VIDEO_DUB_VIENEU_REF_AUDIO_FEMALE=<female.wav>

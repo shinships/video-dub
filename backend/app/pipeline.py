@@ -12,6 +12,9 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
@@ -68,6 +71,19 @@ SOURCE_LANG_CODE = os.environ.get("VIDEO_DUB_SOURCE_LANG", "en")
 SOURCE_LANG_GOOGLE = os.environ.get("VIDEO_DUB_SOURCE_LANG_GOOGLE", "en-US")
 SOURCE_LANG_NAME = os.environ.get("VIDEO_DUB_SOURCE_LANG_NAME", "Anh")
 
+# --- Đo chi phí thật ---
+# Sau khi bỏ Vbee, DỊCH là bước duy nhất tốn tiền: STT (Whisper), tách nền (Demucs), tạo
+# giọng (VieNeu) và render (FFmpeg) đều chạy local. Giá USD cho mỗi 1 TRIỆU token, tra theo
+# tên model. Model không có trong bảng -> vẫn đếm token nhưng không quy ra tiền (thà không
+# hiện số tiền còn hơn hiện một con số bịa).
+# CẬP NHẬT KHI GIÁ ĐỔI: Gemini 3.8 Flash đang ở giá giới thiệu, tăng gấp đôi từ 2027-01-01.
+# DeepSeek lấy giá GIỜ CAO ĐIỂM (off-peak rẻ hơn ~2x) để ước tính không bị thấp hơn thực tế.
+MODEL_PRICING_USD_PER_M: dict[str, dict[str, float]] = {
+    "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cached_input": 0.075},
+    "deepseek-v4-pro": {"input": 1.32, "output": 3.96, "cached_input": 0.044},
+}
+USD_TO_VND = float(os.getenv("VIDEO_DUB_USD_TO_VND", "26000"))
+
 # --- Tham số dịch ---
 TRANSLATE_BATCH = 40  # Số câu mỗi lời gọi Gemini (dịch theo lô).
 TRANSLATE_WORKERS = 4  # Số lô dịch song song.
@@ -113,26 +129,147 @@ TTS_WORKERS = int(os.getenv("VIDEO_DUB_TTS_WORKERS", "2"))
 BACKOFF_MAX_RETRIES = 6
 BACKOFF_BASE_SECONDS = 8.0
 # --- Cắt lặng đầu/đuôi audio TTS trước khi đo độ dài ---
-# VieNeu/Vbee hay đệm 0.1-0.4s im lặng hai đầu -> đo dài giả, kích hoạt viết-lại/tăng tốc
+# VieNeu hay đệm 0.1-0.4s im lặng hai đầu -> đo dài giả, kích hoạt viết-lại/tăng tốc
 # oan và gây cảm giác vào câu trễ. Ngưỡng thấp + giữ chút lặng cho êm, tránh cụt phụ âm nhẹ.
 TTS_TRIM_THRESHOLD = "-50dB"
 TTS_TRIM_KEEP = 0.06  # Giây lặng giữ lại mỗi đầu.
 
 
+# Job nào đang chạy trong ngữ cảnh hiện tại. ContextVar chứ không phải biến toàn cục vì
+# `asyncio.to_thread` COPY context sang thread — nhờ đó `run()` gọi từ trong thread TTS/render
+# vẫn biết mình thuộc job nào mà không phải thêm tham số vào cả chục chỗ gọi.
+CURRENT_JOB: ContextVar[str | None] = ContextVar("video_dub_current_job", default=None)
+
+
+class _JobProcesses:
+    """Sổ theo dõi subprocess đang sống theo job, để HUỶ là giết được thật.
+
+    Trước đây huỷ chỉ được kiểm ở ranh giới `_stage()`: Demucs/Whisper/FFmpeg đã chạy rồi thì
+    vẫn chạy tiếp tới hết, ăn CPU và có khi cả chục phút sau job mới thật sự dừng. Người dùng
+    bấm huỷ xong thấy quạt vẫn rú là mất lòng tin ngay.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._live: dict[str, set[subprocess.Popen[str]]] = {}
+        self._cancelled: set[str] = set()
+
+    def add(self, job_id: str, proc: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._live.setdefault(job_id, set()).add(proc)
+
+    def discard(self, job_id: str, proc: subprocess.Popen[str]) -> None:
+        with self._lock:
+            live = self._live.get(job_id)
+            if live is not None:
+                live.discard(proc)
+                if not live:
+                    self._live.pop(job_id, None)
+
+    def cancel(self, job_id: str) -> int:
+        """Đánh dấu huỷ và kết liễu mọi tiến trình con của job. Trả số tiến trình đã giết."""
+        with self._lock:
+            self._cancelled.add(job_id)
+            procs = list(self._live.get(job_id, ()))
+        killed = 0
+        for proc in procs:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()  # SIGTERM: ffmpeg/demucs thoát sạch và nhanh
+                    killed += 1
+            except OSError:
+                pass  # tiến trình vừa tự kết thúc — không có gì để giết
+        return killed
+
+    def is_cancelled(self, job_id: str | None) -> bool:
+        if job_id is None:
+            return False
+        with self._lock:
+            return job_id in self._cancelled
+
+    def forget(self, job_id: str) -> None:
+        """Quên job sau khi chạy xong. BẮT BUỘC, nếu không cờ huỷ còn lại sẽ làm lần chạy
+        sau (bấm Thử lại) bị coi là đã huỷ ngay từ lệnh subprocess đầu tiên."""
+        with self._lock:
+            self._cancelled.discard(job_id)
+            self._live.pop(job_id, None)
+
+
+_job_processes = _JobProcesses()
+
+
+def cancel_job_processes(job_id: str) -> int:
+    return _job_processes.cancel(job_id)
+
+
+def can_resume_export(job: dict[str, Any]) -> bool:
+    """Job có đủ thứ để chạy lại pha export không (nền đã tách + có phân đoạn để đọc).
+
+    Chỉ nhìn cột `stage` là chưa đủ: có job mang stage="export" nhưng thư mục rỗng và không
+    có phân đoạn nào (gặp thật trong dữ liệu — job chết trước khi kịp ghi gì). Xếp nó chạy
+    lại thì vỡ ở `job["artifacts"]["background"]` với `KeyError: 'background'` — thông báo
+    vô nghĩa với người dùng, lại còn giống hệt một lỗi thật.
+    """
+    background = (job.get("artifacts") or {}).get("background")
+    if not background or not Path(background).is_file():
+        return False
+    with connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM segments WHERE job_id = ?", (job["id"],)
+        ).fetchone()[0]
+    return count > 0
+
+
+@contextmanager
+def job_context(job_id: str):
+    """Gắn mọi subprocess sinh ra bên trong vào `job_id`, và dọn sổ khi xong."""
+    token = CURRENT_JOB.set(job_id)
+    try:
+        yield
+    finally:
+        CURRENT_JOB.reset(token)
+        _job_processes.forget(job_id)
+
+
 def run(command: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    """Chạy subprocess, có đăng ký để huỷ job là giết được ngay.
+
+    Dùng Popen thay cho `subprocess.run` vì `run()` chỉ trả về khi tiến trình đã xong — không
+    có handle nào để giết giữa chừng.
+    """
+    job_id = CURRENT_JOB.get()
+    proc = subprocess.Popen(
         command,
-        check=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         # Không set encoding -> subprocess dùng locale mặc định (cp1252 trên Windows),
         # crash reader thread nếu subprocess (ffmpeg/demucs) in byte ngoài cp1252 và
         # nuốt mất log thật của lỗi gốc. Ép UTF-8 + thay thế ký tự lỗi thay vì crash.
         encoding="utf-8",
         errors="replace",
-        timeout=timeout,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
+    if job_id:
+        _job_processes.add(job_id, proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except BaseException:
+        # Quá giờ hoặc bị ngắt: giết rồi thu xác, đừng để tiến trình mồ côi chạy tiếp.
+        proc.kill()
+        proc.communicate()
+        raise
+    finally:
+        if job_id:
+            _job_processes.discard(job_id, proc)
+
+    # Kiểm tra huỷ TRƯỚC khi xét returncode: tiến trình bị ta giết sẽ trả mã lỗi, báo thành
+    # "FFmpeg thất bại" thì che mất nguyên nhân thật là người dùng vừa bấm huỷ.
+    if _job_processes.is_cancelled(job_id):
+        raise asyncio.CancelledError
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, command, stdout, stderr)
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
 def probe(path: Path) -> dict[str, Any]:
@@ -156,6 +293,21 @@ def probe(path: Path) -> dict[str, Any]:
     return {"duration": duration, "width": video.get("width", 0), "height": video.get("height", 0)}
 
 
+def check_duration(seconds: float) -> None:
+    """Chốt chặn thời lượng DUY NHẤT của dự án.
+
+    Trước đây bốn chỗ nói bốn con số: `service.MAX_DURATION_SECONDS` là 14400 nhưng câu báo
+    lỗi ngay dưới nó ghi "30 phút", pipeline tự kiểm lại và báo "4 giờ", còn UI ghi "30 phút".
+    Người dùng tải video 45 phút lên sẽ được nhận — rồi đọc thông báo nói giới hạn là 30 phút.
+    """
+    limit = settings.max_duration_seconds
+    if seconds > limit:
+        raise PipelineError(
+            f"Video dài {seconds / 60:.0f} phút, vượt giới hạn {settings.duration_limit_label}. "
+            "Đổi mức này trong Cài đặt nếu cần."
+        )
+
+
 def _seconds(duration: Any) -> float:
     if duration is None:
         return 0.0
@@ -164,8 +316,41 @@ def _seconds(duration: Any) -> float:
     return float(getattr(duration, "seconds", duration))
 
 
+def _new_vertex_client(genai: Any) -> Any:
+    with google_auth_scope():
+        return genai.Client(
+            vertexai=True,
+            credentials=_active_gcloud_credentials(),
+            project=settings.google_project,
+            location=settings.google_region,
+        )
+
+
+@contextmanager
+def google_auth_scope():
+    """Tạm ẩn GOOGLE_APPLICATION_CREDENTIALS trong lúc DỰNG client Google, rồi trả lại nguyên trạng.
+
+    Biến này hay được set toàn hệ thống cho một công cụ KHÁC (vd service account của Google
+    Docs) và sẽ âm thầm chiếm quyền xác thực, khiến Speech/TTS bị từ chối dù project đích đã
+    bật API. Bản cũ xử lý bằng cách `os.environ.pop(...)` ngay lúc import config — tức xoá
+    vĩnh viễn khỏi cả tiến trình. Chấp nhận được với script cá nhân, KHÔNG chấp nhận được với
+    phần mềm cài trên máy người khác: nó phá luôn mọi thư viện Google khác trong cùng tiến trình.
+
+    Client Google phân giải credentials ngay lúc khởi tạo nên chỉ cần che trong phạm vi đó.
+    """
+    if not settings.google_prefer_adc:
+        yield
+        return
+    saved = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+    try:
+        yield
+    finally:
+        if saved is not None:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = saved
+
+
 def _active_gcloud_credentials():
-    if os.getenv("VIDEO_DUB_USE_GCLOUD_AUTH", "").lower() not in {"1", "true", "yes"}:
+    if not settings.google_gcloud_token:
         return None
     from google.oauth2.credentials import Credentials
 
@@ -329,19 +514,24 @@ def ensure_engine_voices_ready(engine: str) -> None:
         )
 
 
-def segment_audio_suffix(engine: str) -> str:
-    """Đuôi file audio đoạn theo engine: VieNeu save ra WAV, Gemini trả bytes MP3."""
-    return ".wav" if engine == "vieneu" else ".mp3"
+# Engine TTS duy nhất còn lại (Vbee và Gemini TTS đều đã bỏ). Giữ hằng số thay vì rải chuỗi
+# "vieneu" khắp nơi để lần thêm engine sau chỉ phải sửa một chỗ.
+TTS_ENGINE = "vieneu"
+
+
+def segment_audio_suffix(engine: str = TTS_ENGINE) -> str:
+    """Đuôi file audio đoạn. VieNeu save ra WAV."""
+    return ".wav"
 
 
 def resolve_tts_engine(job: dict[str, Any]) -> str:
-    """Engine của riêng job (đặt qua PATCH /api/jobs) thắng; job không đặt thì dùng
-    VIDEO_DUB_TTS_ENGINE toàn cục -> nhiều job chạy song song có thể khác engine nhau."""
-    return job.get("tts_engine") or settings.tts_engine
+    """Chỉ còn VieNeu. Job cũ trong DB có thể còn tts_engine='vbee' (engine đã gỡ) — ép về
+    VieNeu thay vì để job hỏng ở bước TTS, vì user không sửa được cột đó từ UI nữa."""
+    return TTS_ENGINE
 
 
 # Giọng "chưa chọn" trong DB: "Aoede" là tên giọng của Vertex AI (engine TTS cũ, đã bỏ) và vẫn
-# đang là mặc định của cột jobs.voice — không phải voiceCode Vbee nên phải bỏ qua, dùng giọng
+# đang là mặc định của cột jobs.voice — không phải preset VieNeu nên phải bỏ qua, dùng giọng
 # cấu hình trong env.
 LEGACY_VOICE_PLACEHOLDERS = {None, "", "Aoede"}
 
@@ -354,7 +544,7 @@ def resolve_segment_voice(
     job_voice: str | None = None,
     known_voices: list[str] | None = None,
 ) -> Any:
-    """Chọn giọng cho một đoạn: trả voiceCode (str) cho Vbee, infer_kwargs (dict) cho VieNeu.
+    """Chọn giọng cho một đoạn: trả infer_kwargs (dict) cho VieNeu.
     Multi-speaker TẮT (hoặc speaker không phải nam/nữ) -> giọng mặc định 1-giọng như cũ. BẬT:
     female -> giọng nữ, male -> giọng nam; giọng giới tính chưa cấu hình thì fallback về mặc
     định (giọng nam mặc định kế thừa cấu hình 1-giọng nên không phải khai lại).
@@ -364,13 +554,6 @@ def resolve_segment_voice(
         known_voices is not None and job_voice not in known_voices
     ):
         job_voice = None
-    if engine == "vbee":
-        default = job_voice or cfg.vbee_voice
-        if not multi_speaker or speaker not in ("male", "female"):
-            return default
-        if speaker == "female":
-            return cfg.vbee_voice_female or default
-        return cfg.vbee_voice_male or default
     # VieNeu (và mọi engine local khác dùng infer_kwargs): giọng chọn trên UI là preset, nên
     # thắng cả ref_audio trong env (người dùng vừa chỉ định rõ giọng khác).
     default_kwargs = (
@@ -381,6 +564,87 @@ def resolve_segment_voice(
     if speaker == "female":
         return vieneu_infer_kwargs(cfg.vieneu_voice_female, cfg.vieneu_ref_audio_female) or default_kwargs
     return vieneu_infer_kwargs(cfg.vieneu_voice_male, cfg.vieneu_ref_audio_male) or default_kwargs
+
+
+_VI_DIGITS = ["không", "một", "hai", "ba", "bốn", "năm", "sáu", "bảy", "tám", "chín"]
+_VI_SCALES = ["", "nghìn", "triệu", "tỷ", "nghìn tỷ", "triệu tỷ"]
+
+
+def _vi_three(n: int, full: bool) -> str:
+    """Đọc nhóm 3 chữ số (0-999). full=True: nhóm không đứng đầu -> đọc cả 'không trăm', 'lẻ'."""
+    h, t, u = n // 100, (n // 10) % 10, n % 10
+    words: list[str] = []
+    if h or full:
+        words += [_VI_DIGITS[h], "trăm"]
+    if t == 0:
+        if u and (h or full):
+            words.append("lẻ")
+    elif t == 1:
+        words.append("mười")
+    else:
+        words += [_VI_DIGITS[t], "mươi"]
+    if u:
+        if u == 1 and t > 1:
+            words.append("mốt")
+        elif u == 5 and t > 0:
+            words.append("lăm")
+        elif u == 4 and t > 1:
+            words.append("tư")
+        else:
+            words.append(_VI_DIGITS[u])
+    return " ".join(words)
+
+
+def vi_number_words(n: int) -> str:
+    """Số nguyên -> chữ tiếng Việt: 15000 -> 'mười lăm nghìn', 1250000 -> 'một triệu hai trăm năm mươi nghìn'."""
+    if n == 0:
+        return "không"
+    groups: list[int] = []
+    while n:
+        groups.append(n % 1000)
+        n //= 1000
+    if len(groups) > len(_VI_SCALES):
+        return " ".join(_VI_DIGITS[int(d)] for d in str(n))
+    parts: list[str] = []
+    for i in range(len(groups) - 1, -1, -1):
+        g = groups[i]
+        if g == 0:
+            continue
+        parts.append(_vi_three(g, full=i != len(groups) - 1))
+        if _VI_SCALES[i]:
+            parts.append(_VI_SCALES[i])
+    return " ".join(parts)
+
+
+_CURRENCY_WORDS = {"USD": "đô la", "US$": "đô la", "$": "đô la", "VND": "đồng", "VNĐ": "đồng", "đ": "đồng", "EUR": "ơ rô", "€": "ơ rô"}
+
+
+def normalize_numbers_for_tts(text: str) -> str:
+    """Chuẩn hoá số trước khi đưa TTS: bỏ dấu phân cách nghìn (15.000 / 15,000 -> 15000),
+    đổi dấu thập phân về dạng đọc 'phẩy', đổi $/USD... thành chữ, % -> phần trăm."""
+    import re
+
+    def _group(m: "re.Match[str]") -> str:
+        return m.group(0).replace(".", "").replace(",", "")
+
+    # Số có nhóm nghìn chuẩn: 1.234.567 hoặc 1,234,567 (mỗi nhóm đúng 3 chữ số).
+    text = re.sub(r"(?<![\d.,])\d{1,3}(?:([.,])\d{3})(?:\1\d{3})*(?![\d]|[.,]\d)", _group, text)
+    # Số thập phân còn lại: 1,5 / 2.75 -> "1 phẩy 5".
+    text = re.sub(r"(\d)[.,](\d)", r"\1 phẩy \2", text)
+    text = re.sub(r"(\d)\s*%", r"\1 phần trăm", text)
+    # Ký hiệu tiền đứng TRƯỚC số ($15000) -> sau số; đứng sau (15000 USD) -> chữ.
+    text = re.sub(r"(US\$|\$|€)\s*(\d+(?: phẩy \d+)?)", lambda m: f"{m.group(2)} {_CURRENCY_WORDS[m.group(1)]}", text)
+    text = re.sub(r"(\d)\s*(USD|VNĐ|VND|EUR|đ)\b", lambda m: f"{m.group(1)} {_CURRENCY_WORDS[m.group(2)]}", text)
+    text = re.sub(r"(\d)\s*[-–]\s*(\d)", r"\1 đến \2", text)  # 3-4 giờ -> 3 đến 4 giờ
+    # Cuối cùng đổi mọi số nguyên thành chữ (VieNeu không tự chuẩn hoá số -> đọc sai/bỏ sót).
+    # Số dài >15 chữ số (mã, số điện thoại) đọc từng chữ số.
+    text = re.sub(
+        r"\d+",
+        lambda m: vi_number_words(int(m.group(0))) if len(m.group(0)) <= 15 and not m.group(0).startswith("0") or m.group(0) == "0"
+        else " ".join(_VI_DIGITS[int(d)] for d in m.group(0)),
+        text,
+    )
+    return text
 
 
 def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None = None) -> None:
@@ -400,7 +664,10 @@ def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None =
         
         # Split text to avoid OOM on long segments
         max_len = 50
-        parts = re.split(r'([.,:;?!]+)', text)
+        text = normalize_numbers_for_tts(text)
+        # Không tách tại dấu chấm/phẩy nằm GIỮA hai chữ số (15.000, 1,5) — trước đây tách thành
+        # "15." + "000" nên đọc thành "mười lăm ... không không không".
+        parts = re.split(r'((?:(?<!\d)[.,]|[.,](?!\d)|[:;?!])+)', text)
         chunks = []
         current = ""
         for part in parts:
@@ -450,277 +717,16 @@ def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None =
         gc.collect()
 
 
-# --- Vbee TTS (cloud tiếng Việt qua HTTP) ---
-VBEE_API_URL = "https://api.vbee.vn/v1/tts"
-# Hai đường đi cùng một URL: Realtime (mode "sync", trả thẳng audio, ~500ms, trần 300 ký tự) và
-# Batch (mode "async": POST nhận requestId, poll GET .../requests/{id} tới COMPLETED rồi tải
-# audioLink). Sync nhanh hơn hẳn nhưng có gói tài khoản không mở -> luôn có đường lùi về async.
-# webhookUrl bắt buộc ở chế độ async dù ta không dùng webhook (chỉ poll) nên đặt placeholder.
-VBEE_WEBHOOK_PLACEHOLDER = os.getenv("VIDEO_DUB_VBEE_WEBHOOK", "https://example.com/vbee-webhook")
-VBEE_POLL_INTERVAL = 2.0  # Giây giữa mỗi lần poll trạng thái.
-VBEE_POLL_TIMEOUT = 180.0  # Trần chờ một đoạn TTS xong (giây).
-VBEE_HTTP_TIMEOUT = 60.0  # Timeout mỗi HTTP call (giây).
-VBEE_SYNC_MAX_CHARS = 300  # Trần ký tự của Realtime API; dài hơn buộc đi async.
-VBEE_SYNC_TIMEOUT = 30.0  # Sync trả trong ~1s, chờ lâu hơn thế thì lùi về async cho nhanh.
-# auto = thử sync cho câu ngắn rồi tự lùi; async = ép Batch như cũ; sync = ưu tiên sync.
-VBEE_MODE = os.getenv("VIDEO_DUB_VBEE_MODE", "auto").strip().lower()
-# Thông điệp Vbee trả khi gói tài khoản chưa mở Realtime -> tắt sync cho cả tiến trình, khỏi
-# tốn một round-trip lỗi cho từng đoạn.
-VBEE_SYNC_UNSUPPORTED = "not supported in user package"
-_vbee_sync_blocked = False
-_vbee_sync_lock = threading.Lock()
-
-
-def vbee_request_payload(text: str, voice: str) -> dict[str, Any]:
-    """Body POST tạo giọng Vbee ở chế độ async (webhookUrl bắt buộc dù ta chỉ poll)."""
-    return {
-        "text": text,
-        "voiceCode": voice,
-        "outputFormat": "mp3",
-        "mode": "async",
-        "webhookUrl": VBEE_WEBHOOK_PLACEHOLDER,
-    }
-
-
-def vbee_sync_payload(text: str, voice: str) -> dict[str, Any]:
-    """Body POST Realtime API (mode sync): trả thẳng audio, không có webhookUrl/requestId."""
-    return {
-        "text": text,
-        "voiceCode": voice,
-        "outputFormat": "mp3",
-        "mode": "sync",
-    }
-
-
-def vbee_should_try_sync(text: str, mode: str | None = None, blocked: bool | None = None) -> bool:
-    """Có nên thử Realtime API cho đoạn này không. Trần 300 ký tự áp cả khi ép mode=sync
-    (câu dài Vbee sẽ từ chối) và cờ blocked chặn hẳn sau lần đầu biết gói không hỗ trợ."""
-    mode = VBEE_MODE if mode is None else mode
-    blocked = _vbee_sync_blocked if blocked is None else blocked
-    if mode == "async" or blocked:
-        return False
-    return len(text) <= VBEE_SYNC_MAX_CHARS
-
-
-def vbee_sync_outcome(status_code: int, content_type: str, body: bytes) -> tuple[str, str]:
-    """Phân loại phản hồi Realtime API -> (kết quả, thông điệp lỗi).
-    'audio' = body là file audio; 'blocked' = gói không mở sync (tắt sync cả tiến trình);
-    'fallback' = lỗi tạm/không rõ, chỉ đoạn này lùi về async. Cố tình KHÔNG raise ở đây: lỗi
-    thật (sai voiceCode, hết credit) sẽ được đường async báo lại với thông điệp rõ ràng."""
-    kind = (content_type or "").split(";")[0].strip().lower()
-    if status_code < 400 and body and (kind.startswith("audio/") or kind == "application/octet-stream"):
-        return "audio", ""
-    message = ""
-    try:
-        data = json.loads(body.decode("utf-8", "ignore")) if body else {}
-    except ValueError:
-        data = {}
-    if isinstance(data, dict):
-        message = vbee_read(data)["error"] or ""
-    if VBEE_SYNC_UNSUPPORTED in message.lower():
-        return "blocked", message
-    return "fallback", message or f"HTTP {status_code}"
-
-
-def vbee_headers() -> dict[str, str]:
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {settings.vbee_token}",
-        "App-Id": settings.vbee_app_id,
-    }
-
-
-def vbee_read(data: dict[str, Any]) -> dict[str, Any]:
-    """Bóc các trường cần từ phản hồi Vbee, chịu được cả dạng bọc trong 'result' và lỗi.
-    Trả {request_id, status (in hoa), audio_link, error}."""
-    body = data.get("result") if isinstance(data.get("result"), dict) else data
-    if not isinstance(body, dict):
-        body = {}
-    err = data.get("error") if isinstance(data.get("error"), (dict, str)) else body.get("error")
-    message = err.get("message") if isinstance(err, dict) else (str(err) if err else None)
-    return {
-        "request_id": body.get("requestId") or body.get("request_id"),
-        "status": str(body.get("status") or "").upper(),
-        "audio_link": body.get("audioLink") or body.get("audio_link"),
-        "error": message,
-    }
-
-
-def _vbee_json(resp: Any) -> dict[str, Any]:
-    try:
-        data = resp.json()
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _synth_vbee(text: str, output: Path, voice: str | None = None) -> None:
-    """TTS tiếng Việt qua Vbee: ưu tiên Realtime (sync) cho câu ngắn, lùi về Batch (async)
-    khi câu dài/gói không mở sync/sync lỗi. Mỗi đoạn độc lập nên gọi song song thoải mái
-    (khác VieNeu phải giữ lock)."""
-    import httpx
-
-    if not (settings.vbee_app_id and settings.vbee_token):
-        raise PipelineError(
-            "Thiếu App ID/token Vbee (đặt VIDEO_DUB_VBEE_APP_ID và VIDEO_DUB_VBEE_TOKEN)."
-        )
-    voice = voice or settings.vbee_voice
-    # follow_redirects: audioLink (vbee.vn/s/…) chuyển hướng sang S3 mới ra file thật.
-    with httpx.Client(timeout=VBEE_HTTP_TIMEOUT, follow_redirects=True) as client:
-        if vbee_should_try_sync(text) and _synth_vbee_sync(client, text, output, voice):
-            return
-        _synth_vbee_async(client, text, output, voice)
-
-
-def _synth_vbee_sync(client: Any, text: str, output: Path, voice: str) -> bool:
-    """Realtime API: POST mode sync -> nhận thẳng bytes audio. True nếu đã ghi được file,
-    False nếu cần lùi về async."""
-    global _vbee_sync_blocked
-
-    try:
-        resp = client.post(
-            VBEE_API_URL,
-            headers=vbee_headers(),
-            json=vbee_sync_payload(text, voice),
-            timeout=VBEE_SYNC_TIMEOUT,
-        )
-    except Exception as exc:  # lỗi mạng/timeout -> để async thử lại, đừng làm hỏng cả job
-        print(f"[vbee] sync lỗi mạng, chuyển sang async: {exc}", file=sys.stderr)
-        return False
-
-    result, message = vbee_sync_outcome(
-        resp.status_code, resp.headers.get("content-type", ""), resp.content
-    )
-    if result == "audio":
-        output.write_bytes(resp.content)
-        return True
-    if result == "blocked":
-        with _vbee_sync_lock:
-            if not _vbee_sync_blocked:
-                _vbee_sync_blocked = True
-                print(
-                    f"[vbee] gói tài khoản chưa mở Realtime ({message}) — dùng async từ đây.",
-                    file=sys.stderr,
-                )
-    else:
-        print(f"[vbee] sync thất bại ({message}), chuyển sang async.", file=sys.stderr)
-    return False
-
-
-def _synth_vbee_async(client: Any, text: str, output: Path, voice: str) -> None:
-    """Batch API: POST tạo yêu cầu -> poll tới COMPLETED -> tải audioLink."""
-    headers = vbee_headers()
-    payload = vbee_request_payload(text, voice)
-    info = vbee_read(_vbee_json(client.post(VBEE_API_URL, headers=headers, json=payload)))
-    request_id = info["request_id"]
-    if not request_id:
-        raise PipelineError(f"Vbee từ chối tạo giọng: {info['error'] or 'không rõ lỗi'}")
-
-    deadline = time.monotonic() + VBEE_POLL_TIMEOUT
-    audio_link: str | None = None
-    while True:
-        time.sleep(VBEE_POLL_INTERVAL)
-        info = vbee_read(
-            _vbee_json(client.get(f"{VBEE_API_URL}/requests/{request_id}", headers=headers))
-        )
-        if info["status"] == "COMPLETED" and info["audio_link"]:
-            audio_link = info["audio_link"]
-            break
-        # Response FAILED của Vbee chỉ trả {"error": {...}}, KHÔNG kèm trường status ->
-        # phải coi mọi phản hồi có error là lỗi kết thúc, nếu không sẽ poll tới timeout oan.
-        if info["status"] == "FAILED" or info["error"]:
-            raise PipelineError(f"Vbee tạo giọng thất bại: {info['error'] or 'FAILED'}")
-        if time.monotonic() > deadline:
-            raise PipelineError(
-                f"Vbee quá thời gian chờ ({VBEE_POLL_TIMEOUT:.0f}s) cho một đoạn TTS."
-            )
-
-    audio = client.get(audio_link)
-    if audio.status_code >= 400 or not audio.content:
-        raise PipelineError("Không tải được audio Vbee từ audioLink.")
-    output.write_bytes(audio.content)
-
-
-# --- Danh sách giọng Vbee ---
-VBEE_VOICES_URL = "https://vbee.vn/api/public/v1/voices"
-VBEE_VOICES_TTL = 600.0  # Cache 10 phút: /api/voices bị gọi mỗi lần mở UI.
-VBEE_VOICES_PAGE = 100  # Trần limit của API.
-VBEE_VOICES_MAX_PAGES = 3
-_vbee_voices_cache: dict[str, Any] = {"at": 0.0, "items": []}
-
-
-def parse_vbee_voices(data: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
-    """Bóc danh sách giọng + cursor trang sau từ phản hồi API voices.
-    Chịu được thân JSON thiếu trường (trả về rỗng thay vì ném lỗi)."""
-    result = data.get("result") if isinstance(data.get("result"), dict) else {}
-    raw = result.get("voices") if isinstance(result.get("voices"), list) else []
-    pagination = result.get("pagination") if isinstance(result.get("pagination"), dict) else {}
-    voices: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict) or not item.get("code"):
-            continue
-        gender = item.get("gender") or ""
-        language = item.get("language_code") or item.get("languageCode") or ""
-        voices.append(
-            {
-                "id": item["code"],
-                "label": item.get("name") or item["code"],
-                "desc": " · ".join(part for part in (gender, language) if part),
-                "gender": gender,
-            }
-        )
-    return voices, pagination.get("next_cursor") or pagination.get("nextCursor") or None
-
-
-def fetch_vbee_voices(language_code: str = "vi-VN", ownership: str = "VBEE") -> list[dict[str, Any]]:
-    """Danh sách giọng Vbee thật (có cache TTL). Mọi lỗi -> trả rỗng để UI vẫn chạy khi
-    thiếu credential/offline/demo mode; nơi gọi tự lùi về giọng cấu hình trong env."""
-    import httpx
-
-    now = time.monotonic()
-    if _vbee_voices_cache["items"] and now - _vbee_voices_cache["at"] < VBEE_VOICES_TTL:
-        return list(_vbee_voices_cache["items"])
-    if not (settings.vbee_app_id and settings.vbee_token):
-        return []
-
-    voices: list[dict[str, Any]] = []
-    try:
-        with httpx.Client(timeout=VBEE_SYNC_TIMEOUT, follow_redirects=True) as client:
-            cursor: str | None = None
-            for _ in range(VBEE_VOICES_MAX_PAGES):
-                params: dict[str, Any] = {
-                    "languageCode": language_code,
-                    "voiceOwnership": ownership,
-                    "limit": VBEE_VOICES_PAGE,
-                }
-                if cursor:
-                    params["cursor"] = cursor
-                page, cursor = parse_vbee_voices(
-                    _vbee_json(client.get(VBEE_VOICES_URL, headers=vbee_headers(), params=params))
-                )
-                voices.extend(page)
-                if not cursor or not page:
-                    break
-    except Exception as exc:
-        print(f"[vbee] không lấy được danh sách giọng: {exc}", file=sys.stderr)
-        return []
-
-    if voices:
-        _vbee_voices_cache["items"] = voices
-        _vbee_voices_cache["at"] = now
-    return list(voices)
-
-
 def _is_rate_limited(exc: Exception) -> bool:
-    """Phát hiện lỗi quota/rate-limit (429 / RESOURCE_EXHAUSTED) từ Google API."""
+    """Phát hiện lỗi quota/rate-limit (429 / RESOURCE_EXHAUSTED), server tạm quá tải (503 / UNAVAILABLE), hoặc timeout mạng."""
     name = type(exc).__name__
-    if "ResourceExhausted" in name or "TooManyRequests" in name:
+    if any(k in name for k in ("ResourceExhausted", "TooManyRequests", "ServerError", "ServiceUnavailable", "Timeout", "TimeOut")):
         return True
     code = getattr(exc, "code", None)
-    if callable(code) and "RESOURCE_EXHAUSTED" in str(code()):
+    if callable(code) and any(k in str(code()) for k in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE_EXCEEDED")):
         return True
-    text = str(exc)
-    return "RESOURCE_EXHAUSTED" in text or text.startswith("429") or " 429 " in text
+    text = str(exc).upper()
+    return any(k in text for k in ("RESOURCE_EXHAUSTED", "429", "503", "UNAVAILABLE", "HIGH DEMAND", "RATE_LIMIT", "QUOTA", "TIMED OUT", "TIMEOUT"))
 
 
 def _with_backoff(fn: Callable[[], T], label: str = "call") -> T:
@@ -966,6 +972,59 @@ async def _stage(job_id: str, hook: EventHook, stage: str, progress: int, messag
     await hook(job_id, {"type": "progress", "stage": stage, "progress": progress, "message": message})
 
 
+def cleanup_job_intermediates(job_id: str) -> int:
+    """Xoá file trung gian của một job sau khi xuất xong, trả số byte đã giải phóng.
+
+    Chỗ phình đĩa lớn nhất là `narration-batch-*.wav`: mỗi batch dùng `adelay` theo mốc
+    TUYỆT ĐỐI nên file nào cũng trải dài từ giây 0, tức dung lượng tăng dần theo O(n²) —
+    đo thực tế một job 30 phút để lại ~4.2GB rác cho 379MB kết quả. Chúng được dựng lại
+    ở mỗi lần render nên xoá là an toàn tuyệt đối.
+
+    GIỮ LẠI những thứ cần cho lần export sau mà không phải chạy lại pipeline:
+    `no_vocals.wav` (nền, dùng lại khi user sửa bản dịch rồi xuất lại) và `segment-*.wav`
+    (khỏi phải TTS lại). Nếu xoá cả hai thì mỗi lần sửa một câu sẽ phải tách nền + đọc lại
+    toàn bộ video.
+    """
+    work = settings.jobs_dir / job_id
+    if not work.is_dir():
+        return 0
+    doomed: list[Path] = [
+        *work.glob("narration-batch-*.wav"),
+        *work.glob("filter-batch-*.txt"),
+        *work.glob("filter-complex.txt"),
+    ]
+    source_audio = work / "source.wav"
+    if source_audio.is_file():
+        # Chỉ dùng cho tách nền + STT; cả hai đã xong. Cần lại thì trích từ video gốc (rẻ).
+        doomed.append(source_audio)
+    doomed.extend(work.glob("demucs/*/*/vocals.wav"))  # chỉ phục vụ STT + dò giới tính.
+
+    freed = 0
+    for path in doomed:
+        try:
+            freed += path.stat().st_size
+            path.unlink()
+        except OSError as exc:  # đĩa lỗi/quyền — không đáng làm hỏng job đã xuất xong
+            print(f"[cleanup] bỏ qua {path.name}: {exc}", file=sys.stderr)
+    return freed
+
+
+def delete_job_files(job_id: str) -> int:
+    """Xoá TOÀN BỘ file của một job (thư mục job + video gốc đã upload). Trả số byte đã xoá."""
+    freed = 0
+    work = settings.jobs_dir / job_id
+    if work.is_dir():
+        freed += sum(f.stat().st_size for f in work.rglob("*") if f.is_file())
+        shutil.rmtree(work, ignore_errors=True)
+    for upload in settings.uploads_dir.glob(f"{job_id}.*"):
+        try:
+            freed += upload.stat().st_size
+            upload.unlink()
+        except OSError:
+            pass
+    return freed
+
+
 def seed_demo_job(job_id: str = "demo") -> dict[str, Any]:
     existing = get_job(job_id)
     if existing:
@@ -1014,6 +1073,502 @@ def seed_demo_job(job_id: str = "demo") -> dict[str, Any]:
     return get_job(job_id) or {}
 
 
+class _MultiKeyModelsProxy:
+    def __init__(self, manager: _MultiKeyGenaiClient):
+        self._manager = manager
+
+    def generate_content(self, *args: Any, **kwargs: Any) -> Any:
+        return self._manager.call_generate_content(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        _, client, _ = self._manager.get_active_client()
+        return getattr(client.models, name)
+
+
+class _MultiKeyGenaiClient:
+    """Quản lý và xoay vòng (round-robin / failover) nhiều API key Gemini.
+    - Phân bổ đều các lời gọi (lô song song) qua các key để nhân đôi/nhân ba hạn mức RPM.
+    - Khi một key gặp lỗi quota (429 / RESOURCE_EXHAUSTED), tự động chuyển ngay sang key kế tiếp
+      thay vì phải dừng chờ backoff luỹ thừa.
+    """
+
+    def __init__(
+        self,
+        api_keys: list[str],
+        client_factory: Callable[[str], Any] | None = None,
+    ):
+        self._keys = [k.strip() for k in api_keys if k.strip()]
+        if not self._keys:
+            raise PipelineError("Không có Gemini API key nào hợp lệ.")
+        if client_factory is not None:
+            self._clients = [client_factory(k) for k in self._keys]
+        else:
+            from google import genai
+            from google.genai import types
+
+            self._clients = [
+                genai.Client(api_key=k, http_options=types.HttpOptions(timeout=120000))
+                for k in self._keys
+            ]
+        self._lock = threading.Lock()
+        self._current_index = 0
+        self.models = _MultiKeyModelsProxy(self)
+
+    def get_active_client(self) -> tuple[int, Any, str]:
+        with self._lock:
+            idx = self._current_index % len(self._clients)
+            return idx, self._clients[idx], self._keys[idx]
+
+    def _next_client_index(self) -> int:
+        with self._lock:
+            idx = self._current_index % len(self._clients)
+            self._current_index = (self._current_index + 1) % len(self._clients)
+            return idx
+
+    def _advance_past(self, bad_idx: int) -> None:
+        with self._lock:
+            if self._current_index % len(self._clients) == bad_idx:
+                self._current_index = (bad_idx + 1) % len(self._clients)
+
+    def call_generate_content(self, *args: Any, **kwargs: Any) -> Any:
+        num_keys = len(self._clients)
+        if num_keys == 1:
+            return self._clients[0].models.generate_content(*args, **kwargs)
+
+        last_exc: Exception | None = None
+        start_idx = self._next_client_index()
+        for offset in range(num_keys):
+            idx = (start_idx + offset) % num_keys
+            client = self._clients[idx]
+            key = self._keys[idx]
+            masked = f"{key[:6]}...{key[-4:]}" if len(key) > 10 else "***"
+            try:
+                return client.models.generate_content(*args, **kwargs)
+            except Exception as exc:
+                if not _is_rate_limited(exc):
+                    raise
+                last_exc = exc
+                self._advance_past(idx)
+                next_idx = (idx + 1) % num_keys
+                next_key = self._keys[next_idx]
+                next_masked = f"{next_key[:6]}...{next_key[-4:]}" if len(next_key) > 10 else "***"
+                print(
+                    f"[gemini-keys] Key {masked} chạm hạn mức quota/rate-limit; "
+                    f"chuyển sang key {next_masked} ({offset + 1}/{num_keys})…",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if last_exc:
+            raise last_exc
+
+    def __getattr__(self, name: str) -> Any:
+        _, client, _ = self.get_active_client()
+        return getattr(client, name)
+
+
+DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro"
+DEEPSEEK_TIMEOUT_SECONDS = 90.0
+
+
+class _DeepSeekResponse:
+    # `usage` giữ nguyên payload OpenAI-compatible (prompt_tokens / completion_tokens /
+    # prompt_cache_hit_tokens) để read_response_usage đo được chi phí thật.
+    def __init__(self, text: str, usage: dict[str, Any] | None = None):
+        self.text = text
+        self.usage = usage or {}
+
+
+class _DeepSeekModelsProxy:
+    def __init__(self, manager: _MultiKeyDeepSeekClient):
+        self._manager = manager
+
+    def generate_content(self, *args: Any, **kwargs: Any) -> _DeepSeekResponse:
+        return self._manager.call_generate_content(*args, **kwargs)
+
+
+def deepseek_reasoning_payload(config: Any) -> dict[str, Any]:
+    """Chuyển `thinking_config.thinking_budget=0` (cú pháp google-genai) sang tham số DeepSeek.
+
+    Pipeline ĐÃ yêu cầu tắt thinking cho bước dịch/soát lại, nhưng client DeepSeek trước đây
+    chỉ đọc mỗi `temperature` nên yêu cầu đó bị đánh rơi: đo thực tế thấy 83/102 token output
+    là reasoning, mà output là phía đắt tiền ($3.96/M so với $1.32/M input).
+    Đo A/B trên API thật: 89 -> 22 token completion khi thêm reasoning_effort="none".
+    (Đừng dùng "minimal" — đo được 922 token, còn tệ hơn mặc định.)
+    """
+    thinking = getattr(config, "thinking_config", None) if config is not None else None
+    if thinking is None:
+        return {}
+    budget = getattr(thinking, "thinking_budget", None)
+    return {"reasoning_effort": "none"} if budget == 0 else {}
+
+
+def generate_without_thinking(client: Any, prompt: str, **config_kwargs: Any) -> Any:
+    """Gọi `generate_content` với thinking TẮT; tự lùi về config mặc định nếu model từ chối.
+
+    Cả bốn lời gọi LLM của pipeline đều là việc bám sát chỉ dẫn (dịch, soát glossary, soạn
+    hướng dẫn, rút gọn câu) chứ không phải suy luận nhiều bước, trong khi thinking token bị
+    tính GIÁ OUTPUT — phía đắt gấp 3 lần input. Đo thật trước/sau khi tắt: 804đ -> 238đ cho
+    cùng một đầu vào.
+
+    Gom vào một chỗ vì nhánh lùi (model không hỗ trợ `thinking_budget=0` -> INVALID_ARGUMENT)
+    trước đây được chép lại ở từng call site; chép thêm là sớm muộn cũng trôi lệch nhau.
+    """
+    from google.genai import types
+
+    try:
+        return client.models.generate_content(
+            model=settings.active_translate_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0), **config_kwargs
+            ),
+        )
+    except Exception as exc:
+        if "invalid_argument" in str(exc).lower() or "thinking" in str(exc).lower():
+            return client.models.generate_content(
+                model=settings.active_translate_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+        raise  # lỗi khác (quota/mạng) để _with_backoff lo, đừng nuốt mất
+
+
+class _MultiKeyDeepSeekClient:
+    """Quản lý và xoay vòng (round-robin / failover) nhiều API key DeepSeek.
+    - Gọi endpoint chuẩn OpenAI-compatible (https://api.deepseek.com/chat/completions)
+    - Tương thích 100% với giao diện client.models.generate_content(...) dùng trong pipeline.
+    - Hỗ trợ model deepseek-v4-pro (hoặc deepseek-chat qua VIDEO_DUB_DEEPSEEK_MODEL).
+    - Tự động chuyển đổi key kế tiếp ngay khi gặp lỗi quota / 429.
+    """
+
+    def __init__(
+        self,
+        api_keys: list[str],
+        base_url: str | None = None,
+        model: str | None = None,
+        http_client: Any = None,
+        supports_reasoning_effort: bool = True,
+    ):
+        self._keys = [k.strip() for k in api_keys if k.strip()]
+        if not self._keys:
+            raise PipelineError("Thiếu DEEPSEEK_API_KEY. Vui lòng cấu hình DEEPSEEK_API_KEY trong file .env.")
+        self._base_url = (base_url or DEEPSEEK_DEFAULT_BASE_URL).strip()
+        if not self._base_url.endswith("/chat/completions"):
+            self._base_url = self._base_url.rstrip("/") + "/chat/completions"
+        self._default_model = model or DEEPSEEK_DEFAULT_MODEL
+        self._http_client = http_client
+        self._supports_reasoning_effort = supports_reasoning_effort
+        self._lock = threading.Lock()
+        self._current_index = 0
+        self.models = _DeepSeekModelsProxy(self)
+
+    def get_active_key(self) -> tuple[int, str]:
+        with self._lock:
+            idx = self._current_index % len(self._keys)
+            return idx, self._keys[idx]
+
+    def _next_key(self) -> tuple[int, str]:
+        with self._lock:
+            idx = self._current_index % len(self._keys)
+            self._current_index = (self._current_index + 1) % len(self._keys)
+            return idx, self._keys[idx]
+
+    def _advance_past(self, bad_idx: int) -> None:
+        with self._lock:
+            if self._current_index % len(self._keys) == bad_idx:
+                self._current_index = (bad_idx + 1) % len(self._keys)
+
+    def call_generate_content(
+        self,
+        contents: str | None = None,
+        model: str | None = None,
+        config: Any = None,
+        **kwargs: Any,
+    ) -> _DeepSeekResponse:
+        import httpx
+
+        prompt = contents
+        if prompt is None and "contents" in kwargs:
+            prompt = kwargs["contents"]
+        if prompt is None:
+            prompt = ""
+
+        target_model = self._default_model
+        if model and not str(model).startswith("gemini"):
+            target_model = model
+
+        temperature = 0.2
+        if config is not None:
+            temperature = getattr(config, "temperature", 0.2)
+
+        payload: dict[str, Any] = {
+            "model": target_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Bạn là chuyên gia dịch thuật và lồng tiếng phim song ngữ. Tuân thủ tuyệt đối cấu trúc JSON và hướng dẫn được yêu cầu, không thêm văn bản giải thích hay lời mở đầu thừa.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
+        # Chỉ gửi temperature nếu không phải Claude 3.7+ hoặc Sonnet-5/Opus-5 (nơi temperature bị deprecated trên proxy)
+        if "claude" not in target_model.lower():
+            payload["temperature"] = float(temperature)
+        
+        # reasoning_effort is a DeepSeek-specific capability. Generic providers must opt in
+        # explicitly; model-name matching is unreliable for aliases and proxy routing.
+        if self._supports_reasoning_effort:
+            payload.update(deepseek_reasoning_payload(config))
+
+        num_keys = len(self._keys)
+        last_exc: Exception | None = None
+        start_idx, _ = self._next_key()
+
+        for offset in range(num_keys):
+            idx = (start_idx + offset) % num_keys
+            key = self._keys[idx]
+            masked = f"{key[:6]}...{key[-4:]}" if len(key) > 10 else "***"
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            }
+            try:
+                if self._http_client is not None:
+                    resp = self._http_client.post(
+                        self._base_url,
+                        headers=headers,
+                        json=payload,
+                        timeout=DEEPSEEK_TIMEOUT_SECONDS,
+                    )
+                else:
+                    with httpx.Client(timeout=DEEPSEEK_TIMEOUT_SECONDS) as client:
+                        resp = client.post(
+                            self._base_url,
+                            headers=headers,
+                            json=payload,
+                        )
+
+                if resp.status_code == 429:
+                    raise PipelineError(f"DeepSeek 429 RateLimit/QuotaExceeded: {resp.text}")
+                if resp.status_code >= 500:
+                    raise PipelineError(f"DeepSeek {resp.status_code} ServerError: {resp.text}")
+                if resp.status_code != 200:
+                    raise PipelineError(f"DeepSeek HTTP {resp.status_code}: {resp.text}")
+
+                data = resp.json()
+                choices = data.get("choices") or []
+                if not choices:
+                    raise PipelineError(f"DeepSeek API trả về rỗng: {data}")
+                text = choices[0].get("message", {}).get("content", "")
+                return _DeepSeekResponse(text=text, usage=data.get("usage") or {})
+            except Exception as exc:
+                if not _is_rate_limited(exc):
+                    raise
+                last_exc = exc
+                self._advance_past(idx)
+                next_idx = (idx + 1) % num_keys
+                next_key = self._keys[next_idx]
+                next_masked = f"{next_key[:6]}...{next_key[-4:]}" if len(next_key) > 10 else "***"
+                print(
+                    f"[deepseek-keys] Key {masked} chạm hạn mức quota/rate-limit; "
+                    f"chuyển sang key {next_masked} ({offset + 1}/{num_keys})…",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        if last_exc:
+            raise last_exc
+        raise PipelineError("Không thể kết nối đến DeepSeek API.")
+
+
+class _FallbackTranslationClient:
+    """Quản lý failover giữa hai nhà cung cấp dịch thuật (Gemini và DeepSeek).
+    - Ưu tiên primary client.
+    - Khi primary client chạm quota/rate-limit trên mọi key,
+      tự động failover ngay sang secondary client để hoàn thành job!
+    """
+
+    def __init__(self, primary_client: Any, secondary_client: Any, primary_name: str, secondary_name: str):
+        self._primary = primary_client
+        self._secondary = secondary_client
+        self._primary_name = primary_name
+        self._secondary_name = secondary_name
+        self.models = self
+
+    def generate_content(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._primary.models.generate_content(*args, **kwargs)
+        except Exception as exc:
+            if not _is_rate_limited(exc) and "quota" not in str(exc).lower():
+                raise
+            print(
+                f"[provider-fallback] {self._primary_name} chạm quota/rate-limit; "
+                f"tự động chuyển sang {self._secondary_name}…",
+                file=sys.stderr,
+                flush=True,
+            )
+            return self._secondary.models.generate_content(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._primary, name)
+
+
+@dataclass
+class TokenUsage:
+    """Token của một (hoặc nhiều) lời gọi LLM.
+
+    `input_tokens` là phần input PHẢI TRẢ GIÁ ĐẦY ĐỦ; phần đọc từ cache tách riêng vì rẻ hơn
+    10-30 lần. Cả Gemini lẫn DeepSeek đều báo tổng prompt ĐÃ GỒM cache, nên phải trừ ra —
+    cộng thẳng sẽ tính tiền cache theo giá full.
+    """
+
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    calls: int = 0
+
+    def add(self, other: "TokenUsage") -> None:
+        self.input_tokens += other.input_tokens
+        self.cached_input_tokens += other.cached_input_tokens
+        self.output_tokens += other.output_tokens
+        self.calls += other.calls
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "output_tokens": self.output_tokens,
+            "calls": self.calls,
+        }
+
+
+def read_response_usage(response: Any) -> TokenUsage | None:
+    """Đọc số token thật từ response, chịu cả hai dạng: `usage_metadata` (google-genai) và
+    `usage` kiểu OpenAI (DeepSeek). Không có thông tin -> None (đếm lời gọi, bỏ qua token)."""
+    meta = getattr(response, "usage_metadata", None)
+    if meta is not None:
+        cached = int(getattr(meta, "cached_content_token_count", 0) or 0)
+        prompt = int(getattr(meta, "prompt_token_count", 0) or 0)
+        # `thoughts_token_count` KHÔNG nằm trong candidates_token_count nhưng vẫn bị tính
+        # theo GIÁ OUTPUT. Bỏ qua là tính thiếu tiền ở đúng những lời gọi không tắt thinking
+        # (_build_context, _rewrite_shorter).
+        thoughts = int(getattr(meta, "thoughts_token_count", 0) or 0)
+        return TokenUsage(
+            input_tokens=max(0, prompt - cached),
+            cached_input_tokens=cached,
+            output_tokens=int(getattr(meta, "candidates_token_count", 0) or 0) + thoughts,
+            calls=1,
+        )
+    usage = getattr(response, "usage", None)
+    if isinstance(usage, dict):
+        cached = int(usage.get("prompt_cache_hit_tokens") or 0)
+        prompt = int(usage.get("prompt_tokens") or 0)
+        return TokenUsage(
+            input_tokens=max(0, prompt - cached),
+            cached_input_tokens=cached,
+            output_tokens=int(usage.get("completion_tokens") or 0),
+            calls=1,
+        )
+    return None
+
+
+def estimate_usd(usage: TokenUsage, model: str) -> float | None:
+    """Quy token ra USD theo bảng giá. Model lạ -> None (không đoán giá)."""
+    price = MODEL_PRICING_USD_PER_M.get((model or "").strip().lower())
+    if not price:
+        return None
+    return (
+        usage.input_tokens * price["input"]
+        + usage.cached_input_tokens * price.get("cached_input", price["input"])
+        + usage.output_tokens * price["output"]
+    ) / 1_000_000
+
+
+class UsageMeter:
+    """Gom token thật của mọi lời gọi LLM trong một job, tách theo bước.
+
+    Cột `jobs.cost` trước đây CHỈ nhánh demo ghi (một con số cứng), nên không có cách nào
+    biết một video thật tốn bao nhiêu — không đo được thì không bán credit được.
+    Các lô dịch chạy song song trong ThreadPoolExecutor nên phải khoá khi cộng dồn.
+    """
+
+    def __init__(self, model: str = ""):
+        self.model = model or settings.active_translate_model
+        self._lock = threading.Lock()
+        self._stages: dict[str, TokenUsage] = {}
+
+    def record(self, stage: str, response: Any) -> None:
+        usage = read_response_usage(response)
+        if usage is None:
+            # Vẫn đếm lời gọi: biết "có gọi mà không đọc được token" khác hẳn "không gọi".
+            usage = TokenUsage(calls=1)
+        with self._lock:
+            self._stages.setdefault(stage, TokenUsage()).add(usage)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Bản tóm tắt để ghi vào jobs.cost và hiển thị trên UI."""
+        with self._lock:
+            stages = {name: usage.as_dict() for name, usage in self._stages.items()}
+            total = TokenUsage()
+            for usage in self._stages.values():
+                total.add(usage)
+        usd = estimate_usd(total, self.model)
+        return {
+            "model": self.model,
+            "stages": stages,
+            "total": total.as_dict(),
+            "usd": round(usd, 6) if usd is not None else None,
+            "vnd": round(usd * USD_TO_VND) if usd is not None else None,
+            # Nói rõ để UI không phải đoán: hai bước này chạy local nên không tốn tiền API.
+            "free_local": ["stt", "tts", "separate", "render"],
+        }
+
+
+def merge_cost(old: Any, new: dict[str, Any]) -> dict[str, Any]:
+    """Cộng dồn hai bản ghi chi phí theo từng bước.
+
+    Job đi qua hai pha tách rời (`process` dịch, rồi `export` có thể viết-lại câu), và user
+    có thể export NHIỀU LẦN sau khi sửa bản dịch. Ghi đè sẽ làm mất phần đã tiêu trước đó,
+    tức tính thiếu tiền — nên luôn cộng vào.
+    """
+    stages: dict[str, TokenUsage] = {}
+    for source in (old, new):
+        if not isinstance(source, dict):
+            continue
+        for name, raw in (source.get("stages") or {}).items():
+            if not isinstance(raw, dict):
+                continue
+            stages.setdefault(name, TokenUsage()).add(
+                TokenUsage(
+                    input_tokens=int(raw.get("input_tokens") or 0),
+                    cached_input_tokens=int(raw.get("cached_input_tokens") or 0),
+                    output_tokens=int(raw.get("output_tokens") or 0),
+                    calls=int(raw.get("calls") or 0),
+                )
+            )
+    total = TokenUsage()
+    for usage in stages.values():
+        total.add(usage)
+    model = new.get("model") or (old or {}).get("model") or ""
+    usd = estimate_usd(total, model)
+    return {
+        "model": model,
+        "stages": {name: usage.as_dict() for name, usage in stages.items()},
+        "total": total.as_dict(),
+        "usd": round(usd, 6) if usd is not None else None,
+        "vnd": round(usd * USD_TO_VND) if usd is not None else None,
+        "free_local": ["stt", "tts", "separate", "render"],
+    }
+
+
+def _record_usage(meter: "UsageMeter | None", stage: str, response: Any) -> Any:
+    """Ghi nhận usage nếu có meter, rồi trả lại response để gọi kiểu `return _record_usage(...)`."""
+    if meter is not None:
+        meter.record(stage, response)
+    return response
+
+
 class Pipeline:
     def __init__(self, hook: EventHook):
         self.hook = hook
@@ -1033,10 +1588,11 @@ class Pipeline:
 
     async def process(self, job_id: str) -> None:
         try:
-            if settings.effective_demo_mode:
-                await self._demo_process(job_id)
-            else:
-                await asyncio.to_thread(self._real_process_sync, job_id)
+            with job_context(job_id):
+                if settings.effective_demo_mode:
+                    await self._demo_process(job_id)
+                else:
+                    await asyncio.to_thread(self._real_process_sync, job_id)
             update_job(job_id, status="review", stage="translate", progress=52)
             await self.hook(job_id, {"type": "ready", "message": "Bản dịch đã sẵn sàng để duyệt."})
         except asyncio.CancelledError:
@@ -1062,7 +1618,9 @@ class Pipeline:
             duration=84,
             width=1920,
             height=1080,
-            cost={"stt": 1680, "translation": 2100, "tts": 8400, "total": 12180},
+            # Demo không gọi API nào -> chi phí bằng 0, đúng theo định dạng thật để UI
+            # không phải xử lý hai dạng khác nhau.
+            cost=merge_cost(None, {"model": "(demo)", "stages": {}}),
         )
 
     def _real_process_sync(self, job_id: str) -> None:
@@ -1076,8 +1634,7 @@ class Pipeline:
         work = settings.jobs_dir / job_id
         work.mkdir(parents=True, exist_ok=True)
         metadata = probe(source)
-        if metadata["duration"] > 14400:
-            raise PipelineError("Video vượt giới hạn 4 giờ.")
+        check_duration(metadata["duration"])
         update_job(job_id, **metadata, stage="separate", progress=20)
 
         audio = work / "source.wav"
@@ -1097,7 +1654,11 @@ class Pipeline:
         # 'speaker' để _translate spread giữ lại và _replace_segments lưu vào DB.
         if job.get("multi_speaker"):
             transcripts = self._detect_speakers(speech_path, transcripts)
-        translated, context = self._translate(transcripts, job.get("style", "tự nhiên"))
+        meter = UsageMeter()
+        translated, context = self._translate(transcripts, job.get("style", "tự nhiên"), meter)
+        # Ghi chi phí THẬT vào jobs.cost. Trước đây cột này chỉ nhánh demo ghi một con số
+        # cứng, nên không có cách nào biết một video thật tốn bao nhiêu tiền API.
+        update_job(job_id, cost=merge_cost(job.get("cost"), meter.snapshot()))
         if context:
             # Lưu hướng dẫn dịch để bước viết-lại lúc export giữ đúng glossary/xưng hô.
             update_job(job_id, artifacts={**artifacts, "translate_context": context})
@@ -1227,7 +1788,8 @@ class Pipeline:
         from google.cloud.speech_v2 import SpeechClient
         from google.cloud.speech_v2.types import cloud_speech
 
-        storage_client = storage.Client(project=settings.google_project)
+        with google_auth_scope():
+            storage_client = storage.Client(project=settings.google_project)
         bucket = storage_client.bucket(settings.gcs_bucket)
         object_name = f"video-dub/{job_id}/vocals.wav"
         bucket.blob(object_name).upload_from_filename(vocals)
@@ -1249,7 +1811,9 @@ class Pipeline:
                 inline_response_config=cloud_speech.InlineOutputConfig()
             ),
         )
-        response = SpeechClient().batch_recognize(request=request).result(timeout=3600)
+        with google_auth_scope():
+            client = SpeechClient()
+        response = client.batch_recognize(request=request).result(timeout=3600)
         output: list[dict[str, Any]] = []
         previous_end = 0.0
         for result in response.results[uri].transcript.results:
@@ -1272,23 +1836,90 @@ class Pipeline:
             raise PipelineError("Không phát hiện được lời thoại.")
         return output
 
-    def _genai_client(self):
-        from google import genai
-
+    def _create_deepseek_client(self) -> _MultiKeyDeepSeekClient:
+        keys = settings.deepseek_api_keys
+        if not keys:
+            raise PipelineError("Thiếu DEEPSEEK_API_KEY. Vui lòng cấu hình DEEPSEEK_API_KEY trong file .env.")
+        cache_key = f"deepseek_{settings.deepseek_model}_" + ",".join(keys)
         return self._cached_client(
-            "genai",
-            lambda: genai.Client(
-                vertexai=True,
-                credentials=_active_gcloud_credentials(),
-                project=settings.google_project,
-                location=settings.google_region,
+            cache_key,
+            lambda: _MultiKeyDeepSeekClient(
+                api_keys=keys,
+                base_url=settings.deepseek_base_url,
+                model=settings.deepseek_model,
             ),
         )
 
-    def _build_context(self, client, segments: list[dict[str, Any]]) -> str:
-        """Pass 1 lần: tóm tắt chủ đề + glossary để dịch nhất quán, sát nghĩa."""
-        from google.genai import types
+    def _create_openai_compat_client(self) -> _MultiKeyDeepSeekClient:
+        keys = settings.openai_compat_api_keys
+        if not (keys and settings.openai_compat_base_url and settings.openai_compat_model):
+            raise PipelineError("Thiếu cấu hình OpenAI-compatible provider.")
+        cache_key = f"openai_compat_{settings.openai_compat_model}_" + ",".join(keys)
+        return self._cached_client(
+            cache_key,
+            lambda: _MultiKeyDeepSeekClient(
+                api_keys=keys,
+                base_url=settings.openai_compat_base_url,
+                model=settings.openai_compat_model,
+                supports_reasoning_effort=settings.openai_compat_reasoning_effort,
+            ),
+        )
 
+    def _create_gemini_client(self) -> Any:
+        keys = settings.gemini_api_keys
+        if keys:
+            cache_key = "genai_" + ",".join(keys)
+            return self._cached_client(
+                cache_key,
+                lambda: _MultiKeyGenaiClient(keys),
+            )
+
+        if settings.google_project:
+            from google import genai
+
+            return self._cached_client(
+                f"genai_vertex_{settings.google_project}_{settings.google_region}",
+                lambda: _new_vertex_client(genai),
+            )
+
+        raise PipelineError("Thiếu GEMINI_API_KEY. Vui lòng cấu hình GEMINI_API_KEY trong file .env.")
+
+    def _translation_client(self, engine: str | None = None):
+        target_engine = engine or settings.effective_translate_engine
+        if target_engine == "openai_compat":
+            return self._create_openai_compat_client()
+        has_gemini = bool(getattr(settings, "gemini_api_keys", None) or getattr(settings, "google_project", None))
+        has_deepseek = bool(getattr(settings, "deepseek_api_keys", None))
+        has_openai_compat = bool(getattr(settings, "openai_compat_api_keys", None) and getattr(settings, "openai_compat_base_url", None))
+        fallback_enabled = bool(getattr(settings, "translate_fallback", True))
+
+        # Chế độ Fallback: ưu tiên Gemini, nếu lỗi hoặc hết quota chuyển sang Claude/OpenAI-compat
+        if fallback_enabled and has_gemini and has_openai_compat:
+            primary = self._create_gemini_client()
+            secondary = self._create_openai_compat_client()
+            return _FallbackTranslationClient(primary, secondary, "Gemini", getattr(settings, "openai_compat_model", "openai_compat"))
+
+        if fallback_enabled and has_gemini and has_deepseek:
+            if target_engine == "deepseek":
+                primary = self._create_deepseek_client()
+                secondary = self._create_gemini_client()
+                return _FallbackTranslationClient(primary, secondary, "DeepSeek", "Gemini")
+            else:
+                primary = self._create_gemini_client()
+                secondary = self._create_deepseek_client()
+                return _FallbackTranslationClient(primary, secondary, "Gemini", "DeepSeek")
+
+        # Chế độ đơn provider
+        if target_engine == "deepseek":
+            return self._create_deepseek_client()
+        return self._create_gemini_client()
+
+    def _genai_client(self):
+        """Client dịch thuật (tương thích ngược với các test/mock cũ)."""
+        return self._translation_client()
+
+    def _build_context(self, client, segments: list[dict[str, Any]], meter: UsageMeter | None = None) -> str:
+        """Pass 1 lần: tóm tắt chủ đề + glossary để dịch nhất quán, sát nghĩa."""
         transcript = " ".join(item["text"] for item in segments)[:12000]
         prompt = (
             f"Đọc transcript {SOURCE_LANG_NAME} và soạn NGẮN GỌN bằng tiếng Việt bản HƯỚNG DẪN DỊCH "
@@ -1303,13 +1934,10 @@ class Pipeline:
         )
         try:
             response = _with_backoff(
-                lambda: client.models.generate_content(
-                    model=settings.gemini_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(temperature=0.2),
-                ),
+                lambda: generate_without_thinking(client, prompt, temperature=0.2),
                 label="lấy ngữ cảnh dịch",
             )
+            _record_usage(meter, "context", response)
             return (response.text or "").strip()
         except Exception:
             return ""
@@ -1321,9 +1949,8 @@ class Pipeline:
         all_segments: list[dict[str, Any]],
         style: str,
         context: str,
+        meter: UsageMeter | None = None,
     ) -> dict[int, str]:
-        from google.genai import types
-
         lines = []
         for gi in indices:
             item = all_segments[gi]
@@ -1353,37 +1980,37 @@ class Pipeline:
             'Trả về DUY NHẤT một JSON array, mỗi phần tử {"index": <int>, "vi": "<bản dịch>"}.'
         )
         response = _with_backoff(
-            lambda: client.models.generate_content(
-                model=settings.gemini_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    # Nhiệt thấp để cùng thuật ngữ cho ra cùng bản dịch giữa các lô song song.
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                    response_schema=_translation_schema(),
-                    # Không cần suy luận sâu cho dịch theo lô; tắt thinking vừa nhanh/rẻ hơn vừa
-                    # tránh model tràn ngân sách token vào "thoughts" ẩn rồi cắt cụt câu dịch.
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                ),
+            lambda: generate_without_thinking(
+                client,
+                prompt,
+                # Nhiệt thấp để cùng thuật ngữ cho ra cùng bản dịch giữa các lô song song.
+                temperature=0.2,
+                response_mime_type="application/json",
+                response_schema=_translation_schema(),
             ),
             label="dịch theo lô",
         )
+        _record_usage(meter, "translate", response)
         return _parse_translations(response.text)
 
     def _translate(
-        self, segments: list[dict[str, Any]], style: str = "tự nhiên"
+        self,
+        segments: list[dict[str, Any]],
+        style: str = "tự nhiên",
+        meter: UsageMeter | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
-        """Dịch toàn bộ segments; trả (kết quả, hướng dẫn dịch) để tái dùng khi viết-lại lúc export."""
+        """Dịch toàn bộ segments; trả (kết quả, hướng dẫn dịch) để tái dùng khi viết-lại lúc export.
+        `meter` (nếu có) gom token thật của mọi lời gọi để ghi vào jobs.cost."""
         if not segments:
             return [], ""
         client = self._genai_client()
-        context = self._build_context(client, segments)
+        context = self._build_context(client, segments, meter)
         offsets = list(range(0, len(segments), TRANSLATE_BATCH))
         results: dict[int, str] = {}
 
         def work(offset: int) -> dict[int, str]:
             indices = list(range(offset, min(offset + TRANSLATE_BATCH, len(segments))))
-            return self._translate_chunk(client, indices, segments, style, context)
+            return self._translate_chunk(client, indices, segments, style, context, meter)
 
         with ThreadPoolExecutor(max_workers=min(TRANSLATE_WORKERS, len(offsets))) as pool:
             for mapping in pool.map(work, offsets):
@@ -1395,12 +2022,12 @@ class Pipeline:
         for offset in range(0, len(missing), TRANSLATE_BATCH):
             batch = missing[offset : offset + TRANSLATE_BATCH]
             try:
-                results.update(self._translate_chunk(client, batch, segments, style, context))
+                results.update(self._translate_chunk(client, batch, segments, style, context, meter))
             except Exception:
                 break  # phần còn thiếu rơi xuống fallback tiếng Anh bên dưới
 
         # Soát lại 1 lượt để dọn lệch nhất quán giữa các lô song song (xưng hô/glossary).
-        results.update(self._review_translations(client, segments, results, context))
+        results.update(self._review_translations(client, segments, results, context, meter))
 
         # Fallback cuối: câu nào vẫn thiếu thì giữ nguyên tiếng Anh để không mất đoạn.
         return [
@@ -1414,6 +2041,7 @@ class Pipeline:
         segments: list[dict[str, Any]],
         translated: dict[int, str],
         context: str,
+        meter: UsageMeter | None = None,
     ) -> dict[int, str]:
         """Pass soát lại 1 lời gọi: dịch song song nên xưng hô/thuật ngữ có thể trôi giữa các
         lô dù đã có glossary chung. Gửi toàn bộ bản dịch + hướng dẫn, yêu cầu CHỈ sửa câu lệch
@@ -1429,8 +2057,6 @@ class Pipeline:
         if not rows or len(payload) > REVIEW_MAX_CHARS:
             return {}  # Quá dài -> phản hồi soát kém tin cậy, bỏ qua để không làm hỏng bản tốt.
         try:
-            from google.genai import types
-
             prompt = (
                 "Dưới đây là toàn bộ bản dịch tiếng Việt của một video, dịch theo nhiều lô "
                 "song song nên có thể LỆCH NHẤT QUÁN về xưng hô hoặc thuật ngữ giữa các câu.\n"
@@ -1444,18 +2070,16 @@ class Pipeline:
                 '{"index": <int>, "vi": "<bản sửa>"}. Không câu nào cần sửa thì trả về [].'
             )
             response = _with_backoff(
-                lambda: client.models.generate_content(
-                    model=settings.gemini_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        response_mime_type="application/json",
-                        response_schema=_translation_schema(),
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
+                lambda: generate_without_thinking(
+                    client,
+                    prompt,
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                    response_schema=_translation_schema(),
                 ),
                 label="soát lại bản dịch",
             )
+            _record_usage(meter, "review", response)
         except Exception:
             return {}  # Soát lại là bước tinh chỉnh; lỗi thì giữ nguyên bản dịch, không làm hỏng job.
         fixes = _parse_translations(response.text)
@@ -1504,6 +2128,10 @@ class Pipeline:
                 cursor = end
 
     async def regenerate(self, job_id: str, segment_id: str) -> None:
+        with job_context(job_id):
+            await self._regenerate(job_id, segment_id)
+
+    async def _regenerate(self, job_id: str, segment_id: str) -> None:
         segment = next(
             (item for item in (get_job(job_id) or {}).get("segments", []) if item["id"] == segment_id),
             None,
@@ -1520,11 +2148,14 @@ class Pipeline:
         await self.hook(job_id, {"type": "segment", "segment_id": segment_id, "status": "ready"})
 
     def _rewrite_shorter(
-        self, source_en: str, current_vi: str, seconds: float, context: str = ""
+        self,
+        source_en: str,
+        current_vi: str,
+        seconds: float,
+        context: str = "",
+        meter: UsageMeter | None = None,
     ) -> str | None:
         """Nhờ Gemini viết lại câu Việt ngắn hơn để đọc vừa khung giờ, giữ đủ ý."""
-        from google.genai import types
-
         try:
             client = self._genai_client()
             guide = (
@@ -1542,19 +2173,16 @@ class Pipeline:
                 f"Bản dịch hiện tại: {current_vi}"
             )
             response = _with_backoff(
-                lambda: client.models.generate_content(
-                    model=settings.gemini_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(temperature=0.3),
-                ),
+                lambda: generate_without_thinking(client, prompt, temperature=0.3),
                 label="viết lại câu ngắn hơn",
             )
+            _record_usage(meter, "rewrite", response)
             text = (response.text or "").strip()
             return text or None
         except Exception:
             return None
 
-    def _synthesize_segment(self, job_id: str, segment: dict[str, Any]) -> Path:
+    def _synthesize_segment(self, job_id: str, segment: dict[str, Any], meter: UsageMeter | None = None) -> Path:
         job = get_job(job_id, include_segments=False) or {}
         engine = resolve_tts_engine(job)
         suffix = segment_audio_suffix(engine)
@@ -1562,9 +2190,9 @@ class Pipeline:
         seconds = max(0.5, segment["end"] - segment["start"])
         text = segment["translated_text"]
         # Lồng tiếng 2 giọng: chọn giọng theo nhãn nam/nữ đã dò; multi tắt -> giọng chọn trên UI
-        # (job.voice) hoặc giọng mặc định trong env. VieNeu có danh sách preset offline nên lọc
-        # được giọng lạc engine; Vbee thì không (danh sách phải gọi mạng) -> tin job.voice.
-        known = [voice["id"] for voice in vieneu_preset_voices()] if engine == "vieneu" else None
+        # (job.voice) hoặc giọng mặc định trong env. Lọc theo preset offline để bỏ qua giọng
+        # còn sót của engine cũ (job cũ có thể còn voiceCode Vbee trong cột jobs.voice).
+        known = [voice["id"] for voice in vieneu_preset_voices()]
         voice = resolve_segment_voice(
             engine,
             segment.get("speaker"),
@@ -1578,19 +2206,12 @@ class Pipeline:
         context = (job.get("artifacts") or {}).get("translate_context", "")
         duration = 0.0
         for attempt in range(FIT_MAX_RETRIES + 1):
-            if engine == "vieneu":
-                _synth_vieneu(text, output, voice)
-            elif engine == "vbee":
-                _synth_vbee(text, output, voice)
-            else:
-                raise PipelineError(
-                    f"Engine TTS không hỗ trợ: {engine!r}. Chỉ dùng 'vieneu' hoặc 'vbee'."
-                )
+            _synth_vieneu(text, output, voice)
             _trim_silence(output)
             duration = probe_audio(output)
             if duration <= seconds * FIT_TOLERANCE or attempt == FIT_MAX_RETRIES:
                 break
-            shorter = self._rewrite_shorter(segment["source_text"], text, seconds, context)
+            shorter = self._rewrite_shorter(segment["source_text"], text, seconds, context, meter)
             if not shorter or shorter == text:
                 break
             text = shorter
@@ -1606,9 +2227,18 @@ class Pipeline:
         return output
 
     async def export(self, job_id: str) -> Path:
+        with job_context(job_id):
+            return await self._export(job_id)
+
+    async def _export(self, job_id: str) -> Path:
         job = get_job(job_id)
         if not job:
             raise PipelineError("Không tìm thấy dự án.")
+        if not settings.effective_demo_mode and not can_resume_export(job):
+            raise PipelineError(
+                "Dự án này thiếu file nền đã tách hoặc chưa có phân đoạn nào, không xuất được. "
+                "Hãy chạy lại từ đầu (Thử lại) để tách nền và dịch lại."
+            )
         if settings.effective_demo_mode:
             output = settings.jobs_dir / job_id / "demo-export.txt"
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -1622,14 +2252,26 @@ class Pipeline:
         if pending:
             semaphore = asyncio.Semaphore(TTS_WORKERS)
 
+            # Vòng khớp độ dài có thể gọi LLM (_rewrite_shorter) cho từng câu -> phải đo,
+            # nếu không phần chi phí này biến mất khỏi hoá đơn.
+            export_meter = UsageMeter()
+
             async def synth(segment: dict[str, Any]) -> None:
                 async with semaphore:
-                    await asyncio.to_thread(self._synthesize_segment, job_id, segment)
+                    await asyncio.to_thread(self._synthesize_segment, job_id, segment, export_meter)
 
             await asyncio.gather(*(synth(segment) for segment in pending))
+            current = get_job(job_id, include_segments=False) or {}
+            update_job(job_id, cost=merge_cost(current.get("cost"), export_meter.snapshot()))
         await _stage(job_id, self.hook, "export", 88, "Đang mix và kết xuất MP4…")
         output = await asyncio.to_thread(self._render, job_id)
         update_job(job_id, status="completed", stage="export", progress=100, artifacts={**job["artifacts"], "video": str(output)})
+        # Dọn file trung gian NGAY sau khi có MP4: giữ lại thì mỗi job để lại hàng GB rác
+        # (đo thực tế: 12.5GB trên đĩa cho 1.7GB kết quả). Chạy sau khi đã update_job nên
+        # lỗi dọn dẹp không thể làm job đang "completed" hoá thành lỗi.
+        freed = await asyncio.to_thread(cleanup_job_intermediates, job_id)
+        if freed:
+            print(f"[cleanup] job {job_id}: giải phóng {freed / 1e9:.2f} GB", file=sys.stderr)
         await self.hook(job_id, {"type": "completed", "url": f"/api/jobs/{job_id}/download"})
         return output
 

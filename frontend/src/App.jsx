@@ -9,47 +9,16 @@ import { TranscriptTable } from "./components/TranscriptTable.jsx";
 import { SettingsColumn } from "./components/SettingsColumn.jsx";
 import { UploadModal } from "./components/UploadModal.jsx";
 import { Toast } from "./components/Toast.jsx";
-
-// Dữ liệu demo để UI chạy được khi backend chưa bật (id "fallback-*" = không gọi API).
-const fallbackJob = {
-  id: "fallback-demo",
-  name: "Productivity Tips.mp4",
-  status: "review",
-  stage: "translate",
-  progress: 52,
-  duration: 84,
-  width: 1920,
-  height: 1080,
-  voice: "Aoede",
-  style: "Tự nhiên",
-  speed: 1.1,
-  pitch: 0,
-  cost: { stt: 1680, translation: 2100, tts: 8400, total: 12180 },
-  segments: [
-    ["In this video, I’m going to share 5 simple productivity tips.", "Trong video này, tôi sẽ chia sẻ 5 mẹo tăng năng suất đơn giản.", 92],
-    ["These ideas have changed the way I work.", "Những ý tưởng này đã thay đổi cách tôi làm việc.", 85],
-    ["They help me get more done every day.", "Chúng giúp tôi hoàn thành nhiều việc hơn mỗi ngày.", 96],
-    ["Tip number one is to plan your day the night before.", "Mẹo đầu tiên là lập kế hoạch cho ngày hôm sau từ tối hôm trước.", 90],
-    ["A few minutes of planning can save hours of decision-making.", "Chỉ vài phút lên kế hoạch có thể giúp bạn tiết kiệm hàng giờ đắn đo.", 88],
-    ["Tip number two is to focus on one task at a time.", "Mẹo thứ hai là tập trung vào một việc tại một thời điểm.", 93],
-    ["Multitasking feels productive, but it usually slows you down.", "Đa nhiệm có vẻ hiệu quả, nhưng thường khiến bạn chậm lại.", 79],
-  ].map(([source_text, translated_text, fit_score], index) => ({
-    id: `fallback-${index + 1}`,
-    position: index + 1,
-    start: index * 4.8,
-    end: (index + 1) * 4.8,
-    source_text,
-    translated_text,
-    fit_score,
-    status: "ready",
-  })),
-};
+import { BlankState } from "./components/BlankState.jsx";
+import { SettingsDialog } from "./components/SettingsDialog.jsx";
 
 const LAST_JOB_KEY = "videodub:lastJob";
 
 export function App() {
-  const [job, setJob] = useState(fallbackJob);
-  const [health, setHealth] = useState({ ok: false, demo_mode: true, gpu: { available: false, name: "…" } });
+  // Không có dự án nào cho tới khi backend trả về job thật. Trước đây state khởi tạo bằng
+  // một job bịa sẵn nên người dùng không phân biệt được đâu là dữ liệu của mình.
+  const [job, setJob] = useState(null);
+  const [health, setHealth] = useState(null);
   const [catalog, setCatalog] = useState(null);
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
@@ -58,18 +27,28 @@ export function App() {
   const [busy, setBusy] = useState("");
   const [toast, setToast] = useState(null);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [multiSpeaker, setMultiSpeaker] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
 
   const seekRef = useRef(null);
   const audioRef = useRef(null);
   const playingRef = useRef(null);
-  const jobIdRef = useRef(job.id);
-  jobIdRef.current = job.id;
+  const jobIdRef = useRef(null);
+  jobIdRef.current = job?.id ?? null;
 
   const showToast = useCallback((message, variant = "success") => {
     setToast({ message, variant });
   }, []);
+
+  const applySavedSettings = useCallback(
+    (next) => {
+      setHealth((current) => ({ ...(current || {}), missing: next.missing, ready: next.ready }));
+      api("/voices").then(setCatalog).catch(() => {});
+      showToast("Đã lưu cài đặt.");
+    },
+    [showToast],
+  );
 
   const stopSegmentAudio = useCallback(() => {
     audioRef.current?.pause();
@@ -82,7 +61,7 @@ export function App() {
       setJob(data);
       setActiveSegmentId(null);
       stopSegmentAudio();
-      if (!data.id.startsWith("fallback")) localStorage.setItem(LAST_JOB_KEY, data.id);
+      localStorage.setItem(LAST_JOB_KEY, data.id);
     },
     [stopSegmentAudio],
   );
@@ -97,21 +76,25 @@ export function App() {
   );
 
   useEffect(() => {
-    api("/health").then(setHealth).catch(() => {});
+    api("/health")
+      .then(setHealth)
+      .catch(() => setHealth({ ok: false, offline: true, missing: [], gpu: {} }));
     api("/voices").then(setCatalog).catch(() => {});
-    const last = localStorage.getItem(LAST_JOB_KEY) || "demo";
-    api(`/jobs/${last}`)
-      .then(applyJob)
-      .catch(() => {
-        // Job cũ có thể đã bị xoá — quay về job demo; backend tắt thì giữ fallback.
-        if (last !== "demo") api("/jobs/demo").then(applyJob).catch(() => {});
-      });
+    const last = localStorage.getItem(LAST_JOB_KEY);
+    // Mở lại dự án gần nhất; đã bị xoá (hoặc chưa có) thì lùi về dự án mới nhất trong thư
+    // viện, hết thì để trống — không dựng dữ liệu giả để lấp chỗ.
+    const openLatest = () =>
+      api("/jobs")
+        .then((list) => (list?.length ? api(`/jobs/${list[0].id}`).then(applyJob) : null))
+        .catch(() => {});
+    if (last) api(`/jobs/${last}`).then(applyJob).catch(openLatest);
+    else openLatest();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // SSE: cập nhật tại chỗ từ payload event, chỉ GET lại job ở các mốc lớn.
   useEffect(() => {
-    if (!job.id || job.id.startsWith("fallback")) return undefined;
+    if (!job?.id) return undefined;
     const jobId = job.id;
     let source;
     let timer;
@@ -172,7 +155,7 @@ export function App() {
       source?.close();
       clearTimeout(timer);
     };
-  }, [job.id]);
+  }, [job?.id]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -182,17 +165,17 @@ export function App() {
 
   const visibleSegments = useMemo(() => {
     const needle = deferredQuery.trim().toLowerCase();
-    if (!needle) return job.segments || [];
-    return (job.segments || []).filter(
+    if (!needle) return job?.segments || [];
+    return (job?.segments || []).filter(
       (segment) =>
         segment.source_text.toLowerCase().includes(needle) ||
         segment.translated_text.toLowerCase().includes(needle),
     );
-  }, [job.segments, deferredQuery]);
+  }, [job?.segments, deferredQuery]);
 
   const activeSegment = useMemo(
-    () => (job.segments || []).find((segment) => segment.id === activeSegmentId) || null,
-    [job.segments, activeSegmentId],
+    () => (job?.segments || []).find((segment) => segment.id === activeSegmentId) || null,
+    [job?.segments, activeSegmentId],
   );
 
   const saveTranslation = useCallback(
@@ -203,7 +186,6 @@ export function App() {
           item.id === segment.id ? { ...item, translated_text: text } : item,
         ),
       }));
-      if (segment.id.startsWith("fallback")) return;
       try {
         const updated = await patchJson(`/jobs/${jobIdRef.current}/segments/${segment.id}`, {
           translated_text: text,
@@ -227,26 +209,20 @@ export function App() {
         ),
       }));
       try {
-        if (!segment.id.startsWith("fallback")) {
-          await api(`/jobs/${jobIdRef.current}/segments/${segment.id}/regenerate`, { method: "POST" });
-          // SSE event "segment" sẽ cập nhật trạng thái và refresh khi xong.
-          showToast("Đang tạo lại đoạn giọng…");
-        } else {
-          await new Promise((resolve) => setTimeout(resolve, 700));
-          showToast("Đã tạo lại đoạn giọng");
-        }
+        await api(`/jobs/${jobIdRef.current}/segments/${segment.id}/regenerate`, { method: "POST" });
+        // SSE event "segment" sẽ cập nhật trạng thái và refresh khi xong.
+        showToast("Đang tạo lại đoạn giọng…");
       } catch (error) {
         showToast(error.message, "error");
+        // Trả đoạn về "ready" để nút bấm lại được; không có SSE nào tới sửa hộ.
+        setJob((current) => ({
+          ...current,
+          segments: current.segments.map((item) =>
+            item.id === segment.id ? { ...item, status: "ready" } : item,
+          ),
+        }));
       } finally {
         setBusy("");
-        if (segment.id.startsWith("fallback")) {
-          setJob((current) => ({
-            ...current,
-            segments: current.segments.map((item) =>
-              item.id === segment.id ? { ...item, status: "ready" } : item,
-            ),
-          }));
-        }
       }
     },
     [showToast],
@@ -255,7 +231,7 @@ export function App() {
   const updateJobSettings = useCallback(
     async (values) => {
       setJob((current) => ({ ...current, ...values }));
-      if (jobIdRef.current.startsWith("fallback")) return;
+      if (!jobIdRef.current) return;
       try {
         setJob(await patchJson(`/jobs/${jobIdRef.current}`, values));
       } catch (error) {
@@ -271,8 +247,8 @@ export function App() {
       setBusy("upload");
       const data = new FormData();
       data.append("file", file);
-      data.append("voice", job.voice);
-      data.append("style", job.style);
+      data.append("voice", job?.voice || "");
+      data.append("style", job?.style || "");
       data.append("multi_speaker", multiSpeaker ? "true" : "false");
       try {
         const created = await api("/jobs", { method: "POST", body: data });
@@ -285,32 +261,33 @@ export function App() {
         setBusy("");
       }
     },
-    [job.voice, job.style, multiSpeaker, applyJob, showToast],
+    [job?.voice, job?.style, multiSpeaker, applyJob, showToast],
   );
 
   const exportVideo = useCallback(async () => {
     setBusy("export");
     try {
-      if (jobIdRef.current.startsWith("fallback")) {
-        await new Promise((resolve) => setTimeout(resolve, 900));
-        showToast("Demo export xong — cấu hình Cloud để render MP4 thật");
+      const result = await api(`/jobs/${jobIdRef.current}/export`, { method: "POST" });
+      // Export nay đi qua hàng đợi chung: bấm lần hai không xếp thêm việc, nên đừng báo
+      // như vừa nhận việc mới.
+      if (result?.status === "already_queued") {
+        showToast("Video này đã nằm trong hàng đợi render.");
       } else {
-        await api(`/jobs/${jobIdRef.current}/export`, { method: "POST" });
-        showToast(health.demo_mode ? "Demo export — cấu hình Cloud để render MP4 thật" : "Đang tạo giọng và render video…");
-        // Demo-mode export không bắn SSE — refresh trễ để lấy trạng thái completed.
-        const jobId = jobIdRef.current;
-        setTimeout(() => {
-          api(`/jobs/${jobId}`)
-            .then((data) => setJob((current) => (current.id === jobId ? data : current)))
-            .catch(() => {});
-        }, 1500);
+        showToast(health?.demo_mode ? "Demo export — đây là kết quả giả lập" : "Đang tạo giọng và render video…");
       }
+      // Demo-mode export không bắn SSE — refresh trễ để lấy trạng thái completed.
+      const jobId = jobIdRef.current;
+      setTimeout(() => {
+        api(`/jobs/${jobId}`)
+          .then((data) => setJob((current) => (current.id === jobId ? data : current)))
+          .catch(() => {});
+      }, 1500);
     } catch (error) {
       showToast(error.message, "error");
     } finally {
       setBusy("");
     }
-  }, [health.demo_mode, showToast]);
+  }, [health?.demo_mode, showToast]);
 
   const cancelJob = useCallback(async () => {
     try {
@@ -366,19 +343,58 @@ export function App() {
     [showToast, stopSegmentAudio],
   );
 
+  // Chưa có dự án (hoặc chưa đủ cấu hình) -> không dựng workspace rỗng, cũng không dựng dữ
+  // liệu giả: nói thẳng đang thiếu gì.
+  if (!job) {
+    return (
+      <main className="app-shell">
+        <Topbar
+          currentJob={job}
+          health={health}
+          onSelectJob={loadJob}
+          onUpload={() => setUploadOpen(true)}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
+        <BlankState
+          health={health}
+          onUpload={() => setUploadOpen(true)}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
+        <Toast toast={toast} />
+        {uploadOpen && (
+          <UploadModal
+            busy={busy === "upload"}
+            limitLabel={health?.duration_limit}
+            multiSpeaker={multiSpeaker}
+            onToggleMultiSpeaker={setMultiSpeaker}
+            onUpload={upload}
+            onClose={() => setUploadOpen(false)}
+          />
+        )}
+        {settingsOpen && (
+          <SettingsDialog onClose={() => setSettingsOpen(false)} onSaved={applySavedSettings} />
+        )}
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
-      <Topbar currentJob={job} health={health} onSelectJob={loadJob} onUpload={() => setUploadOpen(true)} />
+      <Topbar
+        currentJob={job}
+        health={health}
+        onSelectJob={loadJob}
+        onUpload={() => setUploadOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
       <Stepper job={job} statusMessage={statusMessage} />
 
       {(job.status === "failed" || job.status === "cancelled") && (
         <div className="error-banner" role="alert">
           <span>{job.status === "failed" ? `Lỗi: ${job.error || "Pipeline thất bại."}` : "Job đã bị hủy."}</span>
-          {!job.id.startsWith("fallback") && (
-            <button type="button" onClick={retryJob}>
-              Thử lại
-            </button>
-          )}
+          <button type="button" onClick={retryJob}>
+            Thử lại
+          </button>
         </div>
       )}
 
@@ -436,11 +452,15 @@ export function App() {
       {uploadOpen && (
         <UploadModal
           busy={busy === "upload"}
+          limitLabel={health?.duration_limit}
           multiSpeaker={multiSpeaker}
           onToggleMultiSpeaker={setMultiSpeaker}
           onUpload={upload}
           onClose={() => setUploadOpen(false)}
         />
+      )}
+      {settingsOpen && (
+        <SettingsDialog onClose={() => setSettingsOpen(false)} onSaved={applySavedSettings} />
       )}
     </main>
   );
