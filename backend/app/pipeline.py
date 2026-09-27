@@ -387,6 +387,34 @@ def segment_tempo(duration: float, slot: float, avail: float) -> float:
     return min(ATEMPO_MAX, duration / avail)
 
 
+TEMPO_MAX_STEP = 0.05  # Chênh tempo tối đa giữa 2 câu liền kề (chống nhịp lúc nhanh lúc chậm).
+
+
+def smooth_tempos(tempos: list[float], max_step: float = TEMPO_MAX_STEP) -> list[float]:
+    """Làm mượt tempo giữa các câu liền kề. CHỈ nâng (không bao giờ hạ) để câu vẫn vừa khung:
+    câu 1.0 kẹp giữa hai câu 1.15 được đẩy lên ~1.10 cho nhịp đều thay vì nhảy 1.15 -> 1.0 -> 1.15."""
+    out = list(tempos)
+    for _ in range(2):
+        for i in range(1, len(out)):
+            out[i] = max(out[i], out[i - 1] - max_step)
+        for i in range(len(out) - 2, -1, -1):
+            out[i] = max(out[i], out[i + 1] - max_step)
+    return [min(ATEMPO_MAX, t) if base <= ATEMPO_MAX else t for t, base in zip(out, tempos)]
+
+
+def segment_tempos(segments: list[dict[str, Any]], bg_seconds: float, probe_fn: Callable[[Path], float]) -> list[float]:
+    tempos: list[float] = []
+    for i, seg in enumerate(segments):
+        duration = float(seg.get("audio_duration") or 0.0)
+        if duration <= 0:
+            duration = probe_fn(Path(seg["audio_path"]))
+        target = max(0.25, seg["end"] - seg["start"])
+        next_start = segments[i + 1]["start"] if i + 1 < len(segments) else bg_seconds
+        avail = next_start - seg["start"] - SPILL_GUARD_SECONDS
+        tempos.append(segment_tempo(duration, target, avail))
+    return smooth_tempos(tempos)
+
+
 def _pitch_chain(semitones: float, sample_rate: int = 48000) -> str:
     """Dịch cao độ giữ nguyên tốc độ (best-effort). Trả về '' nếu không đổi."""
     semitones = max(-6.0, min(6.0, semitones))
@@ -647,6 +675,153 @@ def normalize_numbers_for_tts(text: str) -> str:
     return text
 
 
+# --- Chia/ghép mảnh TTS (chống ngắt quãng giữa câu) ---
+# Trước đây băm 50 ký tự + cắt ở MỌI dấu phẩy: mỗi mảnh đọc riêng có lặng đầu/đuôi riêng và
+# ngữ điệu reset như hết câu, nối thẳng -> khựng giữa câu. Đo thật 27/09/2026: VieNeu đọc ổn
+# tới ~225 ký tự (~10 ký tự/giây, không vỡ). Giữ mảnh dài, chỉ chia ở ranh giới mạnh.
+TTS_CHUNK_MAX = 200
+VIENEU_SAMPLE_RATE = 24000
+TTS_CHUNK_SILENCE_DB = -45.0  # Ngưỡng (so với đỉnh) coi là lặng khi cắt đầu/đuôi từng mảnh.
+TTS_PAUSE_STRONG = 0.22  # Nghỉ sau . ? ! (giây).
+TTS_PAUSE_WEAK = 0.10  # Nghỉ sau , ; : hoặc chỗ buộc phải cắt.
+TTS_CROSSFADE = 0.012
+_TTS_SPLIT_LEVELS = [
+    r"(?<=[.?!…])(?<!\d\.)\s+",
+    r"(?<=[;:])\s+",
+    r"(?<=,)(?<!\d,)\s+",
+]
+
+
+def split_tts_chunks(text: str, max_len: int = TTS_CHUNK_MAX) -> list[str]:
+    """Chia câu cho TTS: ưu tiên ranh giới câu (. ? ! …), rồi ; :, rồi phẩy, cuối cùng mới khoảng
+    trắng (cắt cân hai nửa). Chỉ cắt tại khoảng trắng nên 15.000 / 1,5 không bao giờ bị tách."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+
+    def by_space(chunk: str) -> list[str]:
+        out: list[str] = []
+        while len(chunk) > max_len:
+            n = -(-len(chunk) // max_len)
+            target = len(chunk) // n
+            idx = chunk.rfind(" ", 0, target + 1)
+            if idx <= 0:
+                idx = chunk.find(" ", target)
+            if idx <= 0:
+                idx = max_len
+            out.append(chunk[:idx].strip())
+            chunk = chunk[idx:].strip()
+        if chunk:
+            out.append(chunk)
+        return out
+
+    def split_level(chunk: str, level: int) -> list[str]:
+        if len(chunk) <= max_len:
+            return [chunk]
+        if level >= len(_TTS_SPLIT_LEVELS):
+            return by_space(chunk)
+        parts = [p for p in re.split(_TTS_SPLIT_LEVELS[level], chunk) if p.strip()]
+        if len(parts) == 1:
+            return split_level(chunk, level + 1)
+        out: list[str] = []
+        cur = ""
+        for part in parts:
+            if len(part) > max_len:
+                if cur:
+                    out.append(cur)
+                    cur = ""
+                out.extend(split_level(part, level + 1))
+                continue
+            cand = f"{cur} {part}".strip()
+            if len(cand) <= max_len:
+                cur = cand
+            else:
+                out.append(cur)
+                cur = part
+        if cur:
+            out.append(cur)
+        return out
+
+    return [c for c in split_level(text, 0) if c] if text else []
+
+
+def _trim_chunk(audio: Any, sr: int) -> Any:
+    import numpy as np
+
+    a = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if a.size == 0:
+        return a
+    peak = max(float(np.max(np.abs(a))), 1e-6)
+    thr = 10 ** (TTS_CHUNK_SILENCE_DB / 20) * peak
+    win = max(1, int(sr * 0.01))
+    env = np.convolve(np.abs(a), np.ones(win, dtype=np.float32) / win, mode="same")
+    loud = np.nonzero(env > thr)[0]
+    if loud.size == 0:
+        return a
+    keep = int(sr * 0.03)
+    return a[max(0, int(loud[0]) - keep): min(a.size, int(loud[-1]) + keep)]
+
+
+TTS_INNER_PAUSE_MAX = 0.24  # Trần khoảng lặng GIỮA câu (VieNeu tự nghỉ 0.35-0.5s ở dấu phẩy).
+
+
+def compress_inner_silence(audio: Any, sr: int, max_gap: float = TTS_INNER_PAUSE_MAX) -> Any:
+    """Rút các khoảng lặng bên trong audio dài hơn max_gap về đúng max_gap (giữ 2 mép có fade),
+    để giọng liền mạch hơn mà vẫn còn nhịp nghỉ tự nhiên. Không đụng lặng đầu/đuôi."""
+    import numpy as np
+
+    a = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if a.size == 0:
+        return a
+    peak = max(float(np.max(np.abs(a))), 1e-6)
+    thr = 10 ** (TTS_CHUNK_SILENCE_DB / 20) * peak
+    win = max(1, int(sr * 0.02))
+    env = np.convolve(np.abs(a), np.ones(win, dtype=np.float32) / win, mode="same")
+    quiet = env <= thr
+    loud_idx = np.nonzero(~quiet)[0]
+    if loud_idx.size == 0:
+        return a
+    first, last = int(loud_idx[0]), int(loud_idx[-1])
+    keep = int(sr * max_gap)
+    half = keep // 2
+    out = []
+    pos = 0
+    i = first
+    while i < last:
+        if quiet[i]:
+            j = i
+            while j < last and quiet[j]:
+                j += 1
+            if j - i > keep:
+                out.append(a[pos:i + half])
+                pos = j - (keep - half)
+            i = j
+        else:
+            i += 1
+    out.append(a[pos:])
+    return np.concatenate(out)
+
+
+def join_tts_chunks(items: list[tuple[Any, str]], sr: int) -> Any:
+    """Ghép mảnh TTS: cắt lặng từng mảnh, chèn nghỉ có chủ đích theo dấu câu, fade mép chống click."""
+    import numpy as np
+
+    if len(items) == 1:
+        return np.asarray(items[0][0], dtype=np.float32).reshape(-1)
+    fade = max(1, int(sr * TTS_CROSSFADE))
+    pieces = []
+    for i, (audio, chunk) in enumerate(items):
+        a = _trim_chunk(audio, sr)
+        if a.size > 2 * fade:
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            a = a.copy()
+            a[:fade] *= ramp
+            a[-fade:] *= ramp[::-1]
+        pieces.append(a)
+        if i < len(items) - 1:
+            pause = TTS_PAUSE_STRONG if chunk.rstrip()[-1:] in ".?!…" else TTS_PAUSE_WEAK
+            pieces.append(np.zeros(int(sr * pause), dtype=np.float32))
+    return np.concatenate(pieces)
+
+
 def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None = None) -> None:
     """TTS local bằng VieNeu (không gọi cloud). Giữ lock xuyên suốt nạp + suy luận:
     model giữ trạng thái nội bộ nên không an toàn khi gọi song song, và suy luận vốn
@@ -662,56 +837,25 @@ def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None =
         if infer_kwargs is None:
             infer_kwargs = vieneu_infer_kwargs(settings.vieneu_voice, settings.vieneu_ref_audio)
         
-        # Split text to avoid OOM on long segments
-        max_len = 50
         text = normalize_numbers_for_tts(text)
-        # Không tách tại dấu chấm/phẩy nằm GIỮA hai chữ số (15.000, 1,5) — trước đây tách thành
-        # "15." + "000" nên đọc thành "mười lăm ... không không không".
-        parts = re.split(r'((?:(?<!\d)[.,]|[.,](?!\d)|[:;?!])+)', text)
-        chunks = []
-        current = ""
-        for part in parts:
-            if len(current) + len(part) <= max_len:
-                current += part
-            else:
-                if current:
-                    chunks.append(current.strip())
-                current = part
-        if current:
-            chunks.append(current.strip())
-        
-        final_chunks = []
-        for c in chunks:
-            while len(c) > max_len:
-                idx = c.rfind(' ', 0, max_len)
-                if idx == -1: idx = max_len
-                final_chunks.append(c[:idx].strip())
-                c = c[idx:].strip()
-            if c:
-                final_chunks.append(c)
-        
-        audios = []
-        for chunk in final_chunks:
-            if not chunk: continue
+        chunks = split_tts_chunks(text)
+        audios: list[tuple[Any, str]] = []
+        for chunk in chunks:
             try:
-                a = _vieneu_model.infer(chunk, **infer_kwargs)
-                audios.append(a)
+                audios.append((_vieneu_model.infer(chunk, **infer_kwargs), chunk))
             except Exception:
-                # If ONNX memory error occurs on a chunk, split in half and retry
+                # ONNX hết bộ nhớ ở mảnh dài -> chia đôi tại khoảng trắng rồi đọc lại.
                 mid = len(chunk) // 2
                 idx = chunk.rfind(' ', 0, mid)
                 if idx == -1: idx = mid
-                sub1, sub2 = chunk[:idx].strip(), chunk[idx:].strip()
-                if sub1:
-                    audios.append(_vieneu_model.infer(sub1, **infer_kwargs))
-                if sub2:
-                    audios.append(_vieneu_model.infer(sub2, **infer_kwargs))
-        
+                for sub in (chunk[:idx].strip(), chunk[idx:].strip()):
+                    if sub:
+                        audios.append((_vieneu_model.infer(sub, **infer_kwargs), sub))
+
         if not audios:
-            # Fallback for empty
-            audios = [np.zeros(1, dtype=np.float32)]
-            
-        final_audio = np.concatenate(audios, axis=0)
+            audios = [(np.zeros(1, dtype=np.float32), "")]
+        sr = int(getattr(_vieneu_model, "sample_rate", 0) or VIENEU_SAMPLE_RATE)
+        final_audio = join_tts_chunks(audios, sr)
         _vieneu_model.save(final_audio, str(output))
         import gc
         gc.collect()
@@ -887,6 +1031,14 @@ def merge_transcripts(
                 prev["text"] = f"{prev['text']} {text}"
                 prev["end"] = end
                 continue
+            if not ends_sentence:
+                # Buộc tách GIỮA câu (khe lặng dài / chạm trần) -> nguồn ngắt quãng còn sót.
+                print(
+                    f"[merge] tách giữa câu @{start:.1f}s gap={start - prev['end']:.2f}s "
+                    f"len={end - prev['start']:.1f}s: ...{prev['text'][-40:]!r} | {text[:40]!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         merged.append({"text": text, "start": start, "end": end})
     return merged
 
@@ -2290,6 +2442,7 @@ class Pipeline:
         pitch_chain = _pitch_chain(pitch)
         segments = job["segments"]
         bg_seconds = probe_audio(Path(job["artifacts"]["background"]))
+        tempos = segment_tempos(segments, bg_seconds, probe_audio)
         
         if not segments:
             inputs.extend(["-i", job["source_path"]])
@@ -2324,7 +2477,7 @@ class Pipeline:
                     target = max(0.25, seg["end"] - seg["start"])
                     next_start = segments[g_idx + 1]["start"] if g_idx + 1 < len(segments) else bg_seconds
                     avail = next_start - seg["start"] - SPILL_GUARD_SECONDS
-                    ratio = segment_tempo(duration, target, avail) * speed
+                    ratio = tempos[g_idx] * speed
                     delay = int(seg["start"] / speed * 1000)
                     b_inputs.extend(["-i", str(audio_path)])
                     label = f"s{i}"
@@ -2362,7 +2515,7 @@ class Pipeline:
                 # Khớp trong khung gốc rồi nhân thêm "speed" để theo kịp timeline đã bị nén lại.
                 # Hai thừa số đã kẹp sẵn (tempo ≤ ATEMPO_MAX, speed trong biên) nên nới lo/hi
                 # để tích của chúng không bị kẹp lần nữa làm lệch đồng bộ.
-                ratio = segment_tempo(duration, target, avail) * speed
+                ratio = tempos[index] * speed
                 # Mốc bắt đầu cũng phải chia cho speed để khớp đúng vị trí trên timeline đã tua nhanh.
                 delay = int(segment["start"] / speed * 1000)
                 inputs.extend(["-i", str(audio_path)])
