@@ -6,6 +6,12 @@ from app import service
 from app.config import store
 
 
+def test_stable_video_title_uses_original_title_and_fallback():
+    assert service.stable_video_title("  Claude: Build/Test?  ", "abc123") == "Claude Build Test"
+    assert service.stable_video_title("", "abc123") == "video_abc123"
+    assert service.stable_video_title(None) == "video"
+
+
 def test_is_url():
     assert service.is_url("https://youtu.be/abc")
     assert service.is_url("http://example.com/v.mp4")

@@ -1,6 +1,7 @@
 """Lớp dùng chung cho mọi điểm vào (web API và CLI): chuẩn bị nguồn, tạo job, đường ra."""
 from __future__ import annotations
 
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -16,8 +17,17 @@ def is_url(source: str) -> bool:
     return source.lower().startswith(("http://", "https://"))
 
 
-def download_source(url: str, dest_dir: Path) -> Path:
-    """Tải video từ URL bằng yt-dlp (cài qua requirements-audio)."""
+def stable_video_title(title: str | None, video_id: str | None = None) -> str:
+    """Chuẩn hóa title gốc thành tên file ổn định; không bao giờ dùng title ngẫu nhiên."""
+    value = re.sub(r"[\\/:*?\"<>|\r\n\t]", " ", (title or "")).strip()
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    if not value:
+        value = f"video_{video_id}" if video_id else "video"
+    return value[:160].rstrip(" .")
+
+
+def download_source(url: str, dest_dir: Path) -> tuple[Path, str]:
+    """Tải video từ URL và trả về (file, title YouTube ổn định)."""
     try:
         import yt_dlp
     except ImportError as exc:  # pragma: no cover - phụ thuộc tuỳ chọn
@@ -50,14 +60,15 @@ def download_source(url: str, dest_dir: Path) -> Path:
     video = next((p for p in candidates if p.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm"}), None)
     if not video:
         raise PipelineError(f"Tải xong nhưng không tìm thấy file video cho {url}.")
-    return video
+    title = stable_video_title(info.get("title"), info.get("id"))
+    return video, title
 
 
 def prepare_source(source: str, job_id: str, copy: bool = True) -> tuple[Path, str]:
     """Trả về (đường dẫn dùng cho pipeline, tên hiển thị). Hỗ trợ cả file local lẫn URL."""
     if is_url(source):
-        downloaded = download_source(source, settings.uploads_dir)
-        return downloaded, downloaded.name
+        downloaded, title = download_source(source, settings.uploads_dir)
+        return downloaded, f"{title}{downloaded.suffix}"
     path = Path(source)
     if not path.is_file():
         raise FileNotFoundError(source)

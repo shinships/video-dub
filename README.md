@@ -162,3 +162,7 @@ Nhãn nam/nữ mỗi đoạn hiện ở màn duyệt; nếu dò sai có thể s�
 
 Máy hiện phát hiện NVIDIA Quadro P1000 4GB. Demucs có thể thiếu VRAM với model
 lớn; pipeline sẽ thử CUDA trước rồi tự chạy CPU nếu thất bại.
+
+## Stable output naming
+
+YouTube jobs keep the original YouTube title as the display/output stem. The download filename may use the video ID internally, but it must never become the user-facing title. `backend/app/service.py` sanitizes the title and falls back to `video_<id>` only when YouTube provides no title. Always pass the URL directly to the pipeline so metadata is preserved; do not pre-download and invoke the pipeline with an ID-only filename.
