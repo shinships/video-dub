@@ -1,4 +1,20 @@
-from app.pipeline import normalize_numbers_for_tts as n
+from app.pipeline import apply_tts_pronunciations, normalize_numbers_for_tts as n
+
+
+def test_english_names_use_native_multilingual_phonemizer():
+    from vieneu_utils.phonemize_text import phonemize_text_with_emotions
+
+    text = "Tôi dùng Higgsfield, Blender và Photoshop."
+    assert apply_tts_pronunciations(text) == text
+    phones = phonemize_text_with_emotions(text)
+    assert "hˈɪɡz" in phones and "blˈɛnd" in phones and "ʃ" in phones
+
+
+def test_pronunciation_overrides_do_not_change_vietnamese_ai():
+    assert apply_tts_pronunciations("AI và Higgsfield, LEGO") == "ây ai và Higgsfield, lê gô"
+    assert apply_tts_pronunciations("ai hỏi về higgsfield") == "ai hỏi về higgsfield"
+    assert apply_tts_pronunciations("SAIGON và Higgsfields") == "SAIGON và Higgsfields"
+
 
 
 def test_thousand_separators_and_currency():

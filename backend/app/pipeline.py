@@ -647,6 +647,25 @@ def vi_number_words(n: int) -> str:
 _CURRENCY_WORDS = {"USD": "đô la", "US$": "đô la", "$": "đô la", "VND": "đồng", "VNĐ": "đồng", "đ": "đồng", "EUR": "ơ rô", "€": "ơ rô"}
 
 
+# VieNeu v3 Turbo tự chuyển từ tiếng Anh sang âm vị Anh trong câu Việt.
+# Chỉ giữ ngoại lệ thật sự cần thiết: AI đứng riêng lẻ bị đọc như đại từ Việt;
+# LEGO giữ cách đọc đã được người dùng chọn. Không phiên âm tên riêng hàng loạt.
+TTS_PRONUNCIATIONS = {
+    "LEGO": "lê gô",
+    "AI": "ây ai",
+}
+
+
+def apply_tts_pronunciations(text: str) -> str:
+    import re
+
+    for word, spoken in TTS_PRONUNCIATIONS.items():
+        # AI viết thường là đại từ tiếng Việt "ai": chỉ đổi acronym viết hoa.
+        flags = 0 if word == "AI" else re.IGNORECASE
+        text = re.sub(rf"\b{re.escape(word)}\b", spoken, text, flags=flags)
+    return text
+
+
 def normalize_numbers_for_tts(text: str) -> str:
     """Chuẩn hoá số trước khi đưa TTS: bỏ dấu phân cách nghìn (15.000 / 15,000 -> 15000),
     đổi dấu thập phân về dạng đọc 'phẩy', đổi $/USD... thành chữ, % -> phần trăm."""
@@ -837,7 +856,7 @@ def _synth_vieneu(text: str, output: Path, infer_kwargs: dict[str, str] | None =
         if infer_kwargs is None:
             infer_kwargs = vieneu_infer_kwargs(settings.vieneu_voice, settings.vieneu_ref_audio)
         
-        text = normalize_numbers_for_tts(text)
+        text = apply_tts_pronunciations(normalize_numbers_for_tts(text))
         chunks = split_tts_chunks(text)
         audios: list[tuple[Any, str]] = []
         for chunk in chunks:
