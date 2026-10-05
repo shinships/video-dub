@@ -182,11 +182,11 @@ def send_telegram_video(
 def compress_video(
     src: Path,
     resolution: int = 720,
-    crf: int = 23,
-    preset: str = "fast",
+    crf: int = 20,
+    preset: str = "medium",
     compress_script: Path | None = None,
 ) -> Path | None:
-    """Nén video bằng công cụ video_compress.py (xuống 720p)."""
+    """Nén video bằng công cụ video_compress.py (xuống 720p nét cao: CRF 20, preset medium)."""
     script = compress_script or Path(os.getenv("VIDEO_COMPRESS_SCRIPT", str(DEFAULT_COMPRESS_SCRIPT)))
     if not script.is_file():
         print(f"[Cảnh báo] Không tìm thấy công cụ nén video: {script}", file=sys.stderr)
@@ -206,7 +206,7 @@ def compress_video(
         "--overwrite",
     ]
     try:
-        proc = subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True)
         # video_compress.py tạo file: <tên>_compressed.mp4
         compressed_file = src.parent / f"{src.stem}_compressed.mp4"
         if compressed_file.is_file():
