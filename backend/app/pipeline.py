@@ -647,28 +647,57 @@ def vi_number_words(n: int) -> str:
 _CURRENCY_WORDS = {"USD": "đô la", "US$": "đô la", "$": "đô la", "VND": "đồng", "VNĐ": "đồng", "đ": "đồng", "EUR": "ơ rô", "€": "ơ rô"}
 
 
-# VieNeu v3 Turbo tự chuyển từ tiếng Anh sang âm vị Anh trong câu Việt.
-# Chỉ giữ ngoại lệ thật sự cần thiết: AI đứng riêng lẻ bị đọc như đại từ Việt;
-# LEGO giữ cách đọc đã được người dùng chọn. Không phiên âm tên riêng hàng loạt.
+# VieNeu v3 Turbo tự chuyển từ tiếng Anh sang âm vị Anh trong câu Việt (kể cả acronym như
+# AI -> "ây ai" kiểu Anh). Chỉ giữ ngoại lệ thật sự cần thiết: LEGO giữ cách đọc đã được người
+# dùng chọn. Không phiên âm tên riêng hàng loạt. Đã bỏ override "AI -> ây ai": chữ "ây ai" bị
+# G2P tiếng Việt đọc thành /əɪ aːj/, lệch hơn âm Anh gốc /eɪ aɪ/ mà phonemizer cho sẵn.
 TTS_PRONUNCIATIONS = {
     "LEGO": "lê gô",
-    "AI": "ây ai",
 }
+
+# Phonemizer của VieNeu chỉ đọc theo âm Anh khi từ viết đúng dạng: "CLAUDE"/"HIGGSFIELD" (hoa hết)
+# bị đọc từng chữ cái kiểu Việt ("sê lờ…"), "chatgpt" (thường hết) đọc méo. Tên có chữ hoa giữa
+# từ phải ghi ở đây để chuẩn hoá về dạng chuẩn trước khi đọc.
+TTS_BRAND_CASING = (
+    "ChatGPT", "OpenAI", "GitHub", "YouTube", "TikTok", "iPhone", "iPad", "iOS", "macOS",
+    "DeepSeek", "DeepMind", "LinkedIn", "PayPal", "WhatsApp", "PowerPoint", "JavaScript",
+)
+# Từ hoa toàn bộ dài >= 5 chữ cái có >= 2 nguyên âm coi là TÊN/TỪ (NVIDIA, CLAUDE), không phải
+# acronym đọc từng chữ (HTTPS, WWDC không đủ nguyên âm nên được giữ nguyên).
+TTS_SHOUT_MIN_LEN = 5
+TTS_SHOUT_MIN_VOWELS = 2
+# Địa danh Việt viết hoa không dấu là tiếng Việt, không được chuyển sang đường đọc tiếng Anh.
+TTS_SHOUT_KEEP = {"SAIGON", "HANOI", "DANANG", "VIETNAM", "HUE"}
 
 
 def apply_tts_pronunciations(text: str) -> str:
     import re
 
+    def _unshout(m: "re.Match[str]") -> str:
+        word = m.group(0)
+        if word in TTS_SHOUT_KEEP:
+            return word
+        if len(word) >= TTS_SHOUT_MIN_LEN and sum(c in "AEIOU" for c in word) >= TTS_SHOUT_MIN_VOWELS:
+            return word.capitalize()
+        return word
+
+    text = re.sub(r"\b[A-Z]{2,}\b", _unshout, text)
+    for brand in TTS_BRAND_CASING:
+        text = re.sub(rf"\b{re.escape(brand)}\b", brand, text, flags=re.IGNORECASE)
     for word, spoken in TTS_PRONUNCIATIONS.items():
-        # AI viết thường là đại từ tiếng Việt "ai": chỉ đổi acronym viết hoa.
-        flags = 0 if word == "AI" else re.IGNORECASE
-        text = re.sub(rf"\b{re.escape(word)}\b", spoken, text, flags=flags)
+        text = re.sub(rf"\b{re.escape(word)}\b", spoken, text, flags=re.IGNORECASE)
     return text
+
+
+_MAGNITUDE_WORDS = {"K": "nghìn", "M": "triệu", "B": "tỷ"}
 
 
 def normalize_numbers_for_tts(text: str) -> str:
     """Chuẩn hoá số trước khi đưa TTS: bỏ dấu phân cách nghìn (15.000 / 15,000 -> 15000),
-    đổi dấu thập phân về dạng đọc 'phẩy', đổi $/USD... thành chữ, % -> phần trăm."""
+    đổi dấu thập phân về dạng đọc 'phẩy', đổi $/USD... thành chữ, % -> phần trăm.
+    Token số DÍNH chữ Latin hoặc giờ/ngày (5G, 16GB, 10km, GPT-4o, 3:30, 24/7) được để nguyên cho
+    normalizer của VieNeu: nó đọc đúng đơn vị và gắn thẻ <en>; đổi số thành chữ trước sẽ ra
+    'nămG', 'mườikm', 'bax' rồi bị đọc từng chữ cái."""
     import re
 
     def _group(m: "re.Match[str]") -> str:
@@ -676,17 +705,43 @@ def normalize_numbers_for_tts(text: str) -> str:
 
     # Số có nhóm nghìn chuẩn: 1.234.567 hoặc 1,234,567 (mỗi nhóm đúng 3 chữ số).
     text = re.sub(r"(?<![\d.,])\d{1,3}(?:([.,])\d{3})(?:\1\d{3})*(?![\d]|[.,]\d)", _group, text)
-    # Số thập phân còn lại: 1,5 / 2.75 -> "1 phẩy 5".
-    text = re.sub(r"(\d)[.,](\d)", r"\1 phẩy \2", text)
+    # Số thập phân còn lại: 1,5 / 2.75 -> "1 phẩy 5". Không đụng số phiên bản dính chữ (v2.0).
+    text = re.sub(r"(?<![A-Za-z\d])(\d+)[.,](?=\d)", r"\1 phẩy ", text)
     text = re.sub(r"(\d)\s*%", r"\1 phần trăm", text)
+    # Tiền kèm bậc lớn ($5B, $300M, $2K): normalizer gốc đọc "năm tỷ u s d", nên tự đổi trước.
+    text = re.sub(
+        r"(US\$|\$|€)\s*(\d+(?: phẩy \d+)?)\s*([KMB])\b",
+        lambda m: f"{m.group(2)} {_MAGNITUDE_WORDS[m.group(3)]} {_CURRENCY_WORDS[m.group(1)]}",
+        text,
+    )
     # Ký hiệu tiền đứng TRƯỚC số ($15000) -> sau số; đứng sau (15000 USD) -> chữ.
     text = re.sub(r"(US\$|\$|€)\s*(\d+(?: phẩy \d+)?)", lambda m: f"{m.group(2)} {_CURRENCY_WORDS[m.group(1)]}", text)
     text = re.sub(r"(\d)\s*(USD|VNĐ|VND|EUR|đ)\b", lambda m: f"{m.group(1)} {_CURRENCY_WORDS[m.group(2)]}", text)
+    # 300M / 2B (người dùng, lượt xem): chỉ M, B — K còn có thể là độ phân giải (4K).
+    text = re.sub(
+        r"(?<![A-Za-z\d])(\d+(?: phẩy \d+)?)\s?([MB])\b",
+        lambda m: f"{m.group(1)} {_MAGNITUDE_WORDS[m.group(2)]}",
+        text,
+    )
     text = re.sub(r"(\d)\s*[-–]\s*(\d)", r"\1 đến \2", text)  # 3-4 giờ -> 3 đến 4 giờ
-    # Cuối cùng đổi mọi số nguyên thành chữ (VieNeu không tự chuẩn hoá số -> đọc sai/bỏ sót).
+
+    def _decade(m: "re.Match[str]") -> str:
+        digits = m.group(1)
+        if not digits.endswith("0"):
+            return m.group(0)  # "123s" không phải thập niên
+        if len(digits) == 4 and digits.startswith("19") and digits[2:] != "00":
+            return vi_number_words(int(digits[2:]))  # 1990s -> "chín mươi"
+        return vi_number_words(int(digits))
+
+    # 1990s / 90s: normalizer gốc đọc chữ "s" thành "giây".
+    text = re.sub(r"(?<![A-Za-z\d])(\d{2}|\d{4})s\b", _decade, text)
+    # 1st / 2nd / 3rd / 4th: bỏ hậu tố tiếng Anh, còn lại số thường.
+    text = re.sub(r"(?<![A-Za-z\d])(\d+)(?:st|nd|rd|th)\b", r"\1", text)
+    # Cuối cùng đổi số nguyên ĐỨNG ĐỘC LẬP thành chữ. Bỏ qua số dính chữ Latin (5G, 16GB, GPT-4o)
+    # hoặc nằm trong giờ/ngày (3:30, 24/7) để normalizer gốc đọc đúng ngữ cảnh.
     # Số dài >15 chữ số (mã, số điện thoại) đọc từng chữ số.
     text = re.sub(
-        r"\d+",
+        r"(?<![A-Za-z\d])(?<!\d[:/.])\d+(?![A-Za-z\d]|[:/]\d)",
         lambda m: vi_number_words(int(m.group(0))) if len(m.group(0)) <= 15 and not m.group(0).startswith("0") or m.group(0) == "0"
         else " ".join(_VI_DIGITS[int(d)] for d in m.group(0)),
         text,
@@ -2142,6 +2197,9 @@ class Pipeline:
             "Quan trọng: mỗi câu dịch phải đọc VỪA trong 'max_seconds' (cố gắng không quá 'max_chars' "
             "ký tự) mà vẫn giữ đủ ý — ưu tiên câu gọn, lược từ đệm thừa thay vì cắt nội dung.\n"
             "Dùng prev/next context để giữ mạch, đại từ và thuật ngữ nhất quán.\n"
+            "Tên riêng, thuật ngữ, tên sản phẩm và acronym tiếng Anh (ChatGPT, API, GPU, iPhone...) giữ "
+            "NGUYÊN chữ Latin gốc, KHÔNG phiên âm sang chữ Việt (không viết 'gu gồ', 'ây ai'); "
+            "viết số liền đơn vị chuẩn (16GB, 5G, 10km) vì bước đọc sẽ tự đọc đúng.\n"
             "BẮT BUỘC tuân theo hướng dẫn dịch bên dưới: dùng đúng glossary và đúng cặp xưng hô "
             "đã chọn cho MỌI câu.\n"
             "TUYỆT ĐỐI KHÔNG dùng dấu ngoặc kép \" trong nội dung dịch (cần trích dẫn một cụm từ "
