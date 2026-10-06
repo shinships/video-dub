@@ -60,11 +60,17 @@ SPILL_GUARD_SECONDS = 0.12
 # Tốc độ output mặc định cho job mới: tua nhanh toàn bộ video (hình + nhạc nền + thoại)
 # 10%, đồng bộ tuyệt đối — không chỉ riêng nhịp đọc giọng lồng tiếng.
 DEFAULT_JOB_SPEED = 1.1
-# Video giữ nguyên tốc độ (copy, nhanh) chỉ khi speed ~= 1.0; khác 1.0 phải re-encode để
-# áp setpts nên cần codec/preset cho nhánh này.
+# Video output LUÔN re-encode về tối đa 720p H.264 để giảm dung lượng (copy stream gốc giữ
+# nguyên bitrate nên không nhỏ đi). CRF 21 + preset medium + profile high là mức "chất lượng
+# cao" mà file vẫn nhỏ hơn rõ rệt so với nguồn 1080p/4K; hạ CRF nếu muốn nét hơn.
 VIDEO_CODEC = "libx264"
-VIDEO_PRESET = "veryfast"
-VIDEO_CRF = "18"
+VIDEO_PRESET = "medium"
+VIDEO_CRF = "21"
+VIDEO_PROFILE = "high"
+VIDEO_MAX_HEIGHT = 720
+# `min(...,ih)`: chỉ thu nhỏ, không phóng to video nguồn đã thấp hơn 720p; `-2` giữ tỉ lệ và
+# ép chiều rộng chẵn (yuv420p/H.264 yêu cầu).
+VIDEO_SCALE = f"scale=-2:'min({VIDEO_MAX_HEIGHT},ih)':flags=lanczos"
 
 # --- Tham số Ngôn ngữ gốc ---
 SOURCE_LANG_CODE = os.environ.get("VIDEO_DUB_SOURCE_LANG", "en")
@@ -425,6 +431,22 @@ def _pitch_chain(semitones: float, sample_rate: int = 48000) -> str:
         f",asetrate={int(sample_rate * factor)},aresample={sample_rate},"
         f"{_atempo_chain(1.0 / factor, lo=0.5, hi=2.0)}"
     )
+
+
+def _video_chain(speed: float) -> str:
+    """Chuỗi filter video: tua nhanh theo `speed` (nếu có) rồi thu về tối đa 720p."""
+    if abs(speed - 1.0) > 1e-3:
+        return f"setpts=PTS/{speed:.6f},{VIDEO_SCALE}"
+    return VIDEO_SCALE
+
+
+def _video_encode_args() -> list[str]:
+    """Tham số encode H.264. `+faststart` dời moov lên đầu để xem/stream không phải tải hết;
+    yuv420p để mọi trình phát (QuickTime, Telegram) đều mở được."""
+    return [
+        "-c:v", VIDEO_CODEC, "-preset", VIDEO_PRESET, "-crf", VIDEO_CRF,
+        "-profile:v", VIDEO_PROFILE, "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+    ]
 
 
 _whisper_lock = threading.Lock()
@@ -2507,19 +2529,17 @@ class Pipeline:
         
         if not segments:
             inputs.extend(["-i", job["source_path"]])
+            filters.append(f"[0:v]{_video_chain(speed)}[vout]")
+            audio_args = ["-map", "0:a?", "-c:a", "copy"]
             if speed_changed:
-                filters.append(f"[0:v]setpts=PTS/{speed:.6f}[vout];[0:a]atempo={speed}[aout]")
-                filter_script = work / "filter-complex.txt"
-                filter_script.write_text(";".join(filters), encoding="utf-8")
-                run([
-                    settings.ffmpeg, "-y", *inputs, "-/filter_complex", str(filter_script),
-                    "-map", "[vout]", "-c:v", VIDEO_CODEC, "-preset", VIDEO_PRESET, "-crf", VIDEO_CRF, "-pix_fmt", "yuv420p",
-                    "-map", "[aout]", "-c:a", "aac", "-b:a", "192k", str(output)
-                ])
-            else:
-                run([
-                    settings.ffmpeg, "-y", *inputs, "-c:v", "copy", "-c:a", "copy", str(output)
-                ])
+                filters.append(f"[0:a]atempo={speed}[aout]")
+                audio_args = ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
+            filter_script = work / "filter-complex.txt"
+            filter_script.write_text(";".join(filters), encoding="utf-8")
+            run([
+                settings.ffmpeg, "-y", *inputs, "-/filter_complex", str(filter_script),
+                "-map", "[vout]", *_video_encode_args(), *audio_args, str(output)
+            ], timeout=7200)
             return output
             
         if len(segments) > 30:
@@ -2614,19 +2634,8 @@ class Pipeline:
             f"[bg_ducked][narr_mix]amix=inputs=2:normalize=0,"
             f"alimiter=limit={MIX_LIMIT}[mix]"
         )
-        video_args: list[str]
-        if speed_changed:
-            # setpts nén timeline hình theo đúng "speed" -> phải re-encode, không copy được.
-            filters.append(f"[{source_index}:v]setpts=PTS/{speed:.6f}[vout]")
-            video_args = [
-                "-map", "[vout]",
-                "-c:v", VIDEO_CODEC,
-                "-preset", VIDEO_PRESET,
-                "-crf", VIDEO_CRF,
-                "-pix_fmt", "yuv420p",
-            ]
-        else:
-            video_args = ["-map", f"{source_index}:v:0", "-c:v", "copy"]
+        filters.append(f"[{source_index}:v]{_video_chain(speed)}[vout]")
+        video_args = ["-map", "[vout]", *_video_encode_args()]
         filter_script = work / "filter-complex.txt"
         filter_script.write_text(";".join(filters), encoding="utf-8")
         run(

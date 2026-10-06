@@ -87,6 +87,21 @@ def test_pitch_chain_builds_filters_when_shifted():
     assert "asetrate=" in chain and "aresample=48000" in chain and "atempo=" in chain
 
 
+def test_video_chain_always_scales_and_adds_setpts_only_when_speed_changes():
+    assert pipeline_module._video_chain(1.0) == pipeline_module.VIDEO_SCALE
+    chain = pipeline_module._video_chain(1.1)
+    assert chain.startswith("setpts=PTS/1.100000,") and chain.endswith(pipeline_module.VIDEO_SCALE)
+    # Chỉ thu nhỏ, không phóng to video nguồn thấp hơn 720p.
+    assert "min(720,ih)" in pipeline_module.VIDEO_SCALE
+
+
+def test_video_encode_args_is_h264_never_copy():
+    args = pipeline_module._video_encode_args()
+    assert args[args.index("-c:v") + 1] == "libx264"
+    assert "copy" not in args
+    assert args[args.index("-pix_fmt") + 1] == "yuv420p"
+
+
 def test_strip_json_removes_code_fence():
     fenced = "```json\n[{\"index\": 0, \"vi\": \"xin chào\"}]\n```"
     assert _strip_json(fenced) == '[{"index": 0, "vi": "xin chào"}]'
