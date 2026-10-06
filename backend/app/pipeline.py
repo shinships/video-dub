@@ -655,33 +655,17 @@ TTS_PRONUNCIATIONS = {
     "LEGO": "lê gô",
 }
 
-# Phonemizer của VieNeu chỉ đọc theo âm Anh khi từ viết đúng dạng: "CLAUDE"/"HIGGSFIELD" (hoa hết)
-# bị đọc từng chữ cái kiểu Việt ("sê lờ…"), "chatgpt" (thường hết) đọc méo. Tên có chữ hoa giữa
-# từ phải ghi ở đây để chuẩn hoá về dạng chuẩn trước khi đọc.
+# Dùng tên đã biết thay vì đoán theo số nguyên âm: acronym như NAION cũng có thể dài,
+# nhiều nguyên âm nhưng vẫn cần đọc từng chữ. Chỉ chuẩn hoá bản đưa vào TTS, giữ phụ đề gốc.
 TTS_BRAND_CASING = (
     "ChatGPT", "OpenAI", "GitHub", "YouTube", "TikTok", "iPhone", "iPad", "iOS", "macOS",
     "DeepSeek", "DeepMind", "LinkedIn", "PayPal", "WhatsApp", "PowerPoint", "JavaScript",
+    "Higgsfield", "Claude", "Nvidia", "Blender", "Photoshop",
 )
-# Từ hoa toàn bộ dài >= 5 chữ cái có >= 2 nguyên âm coi là TÊN/TỪ (NVIDIA, CLAUDE), không phải
-# acronym đọc từng chữ (HTTPS, WWDC không đủ nguyên âm nên được giữ nguyên).
-TTS_SHOUT_MIN_LEN = 5
-TTS_SHOUT_MIN_VOWELS = 2
-# Địa danh Việt viết hoa không dấu là tiếng Việt, không được chuyển sang đường đọc tiếng Anh.
-TTS_SHOUT_KEEP = {"SAIGON", "HANOI", "DANANG", "VIETNAM", "HUE"}
 
 
 def apply_tts_pronunciations(text: str) -> str:
-    import re
-
-    def _unshout(m: "re.Match[str]") -> str:
-        word = m.group(0)
-        if word in TTS_SHOUT_KEEP:
-            return word
-        if len(word) >= TTS_SHOUT_MIN_LEN and sum(c in "AEIOU" for c in word) >= TTS_SHOUT_MIN_VOWELS:
-            return word.capitalize()
-        return word
-
-    text = re.sub(r"\b[A-Z]{2,}\b", _unshout, text)
+    """Chuẩn hoá tên đã biết; để VieNeu đọc âm Anh và phân biệt AI với đại từ ai."""
     for brand in TTS_BRAND_CASING:
         text = re.sub(rf"\b{re.escape(brand)}\b", brand, text, flags=re.IGNORECASE)
     for word, spoken in TTS_PRONUNCIATIONS.items():

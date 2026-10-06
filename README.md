@@ -127,6 +127,14 @@ bước tạo giọng mới vỡ sau khi đã tốn STT + tiền dịch.
 Đây là engine TTS duy nhất: bước tạo giọng chạy hoàn toàn trên máy bạn, không gọi cloud và
 không tốn tiền API. Chỉ bước **dịch** mới gọi Gemini/DeepSeek.
 
+Trong lời dẫn tiếng Việt, thuật ngữ và tên riêng như `AI`, `HiggsField`, `iPhone`
+được đọc bằng bộ xử lý song ngữ của VieNeu. Các tên đã biết được chuẩn hoá chữ hoa/
+thường riêng khi tạo giọng; bản dịch và phụ đề giữ chính tả gốc. `AI` đọc từng chữ
+cái tiếng Anh, còn `ai` vẫn là từ tiếng Việt. Có thể bổ sung tên vào
+`TTS_BRAND_CASING` trong `backend/app/pipeline.py`; `TTS_PRONUNCIATIONS` dành cho
+ngoại lệ đã nghe kiểm chứng. Đoạn đã tạo giọng cần dùng chức năng tạo lại để áp dụng
+quy tắc mới.
+
 ## Lồng tiếng 2 giọng (nam/nữ)
 
 Video có cả nam lẫn nữ (phỏng vấn, đối thoại) đọc chung một giọng nghe sai vai. Bật chế độ
